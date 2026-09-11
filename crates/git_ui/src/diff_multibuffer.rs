@@ -8,7 +8,7 @@ use buffer_diff::BufferDiff;
 use collections::{HashMap, HashSet};
 use editor::{
     EditorEvent, EditorSettings, SelectionEffects, SplittableEditor, actions::GoToHunk,
-    multibuffer_context_lines, scroll::Autoscroll,
+    scroll::Autoscroll,
 };
 use futures_lite::future::yield_now;
 use git::{repository::RepoPath, status::FileStatus};
@@ -16,8 +16,8 @@ use gpui::{
     App, AppContext as _, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Render,
     SharedString, Subscription, Task, WeakEntity,
 };
-use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt};
-use multi_buffer::{MultiBuffer, PathKey};
+use language::{Buffer, BufferId, Capability, Point};
+use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
 use project::{
     ConflictSet, Project, ProjectPath,
     git_store::{
@@ -259,7 +259,16 @@ impl DiffMultibuffer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(position) = self.multibuffer.read(cx).location_for_path(&path_key, cx) {
+        if let Some(anchor) = self.multibuffer.read(cx).location_for_path(&path_key, cx) {
+            // Excerpts span whole files, so land on the file's first hunk
+            // rather than its first line.
+            let snapshot = self.multibuffer.read(cx).snapshot(cx);
+            let file_start = anchor.to_point(&snapshot);
+            let position = snapshot
+                .diff_hunks_in_range(file_start..snapshot.max_point())
+                .next()
+                .filter(|hunk| Some(hunk.buffer_id) == anchor.buffer_id())
+                .map_or(file_start, |hunk| Point::new(hunk.row_range.start.0, 0));
             self.editor.update(cx, |editor, cx| {
                 editor.rhs_editor().update(cx, |editor, cx| {
                     editor.change_selections(
@@ -501,27 +510,11 @@ impl DiffMultibuffer {
         );
 
         let snapshot = display_buffer.read(cx).snapshot();
-        let diff_snapshot = diff.read(cx).snapshot(cx);
 
-        let excerpt_ranges = {
-            let diff_hunk_ranges = diff_snapshot
-                .hunks_intersecting_range(
-                    Anchor::min_max_range_for_buffer(snapshot.remote_id()),
-                    &snapshot,
-                )
-                .map(|diff_hunk| diff_hunk.buffer_range.to_point(&snapshot));
-            let conflict_ranges = conflict_set.as_ref().and_then(|conflict_set| {
-                let conflicts = conflict_set.read(cx).snapshot();
-                let conflicts = conflicts
-                    .conflicts
-                    .iter()
-                    .map(|conflict| conflict.range.to_point(&snapshot))
-                    .collect::<Vec<_>>();
-                (!conflicts.is_empty()).then_some(conflicts)
-            });
-
-            conflict_ranges.unwrap_or_else(|| diff_hunk_ranges.collect())
-        };
+        // Show the whole file rather than excerpts around each hunk. A single
+        // full-file excerpt also covers any conflict ranges, and the diff hunks
+        // are still rendered inline since the multibuffer expands them all.
+        let excerpt_ranges = vec![Point::zero()..snapshot.max_point()];
 
         let buffer_id = snapshot.text.remote_id();
         let mut needs_fold = false;
@@ -532,7 +525,7 @@ impl DiffMultibuffer {
                 path_key.clone(),
                 display_buffer,
                 excerpt_ranges,
-                multibuffer_context_lines(cx),
+                0,
                 diff,
                 cx,
             );
@@ -547,15 +540,18 @@ impl DiffMultibuffer {
         self.editor.update(cx, |editor, cx| {
             editor.rhs_editor().update(cx, |editor, cx| {
                 if was_empty {
+                    // Excerpts span whole files, so start on the first hunk
+                    // rather than the first line of the first file.
+                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                    let position = snapshot
+                        .diff_hunks_in_range(Point::zero()..snapshot.max_point())
+                        .next()
+                        .map_or(Point::zero(), |hunk| Point::new(hunk.row_range.start.0, 0));
                     editor.change_selections(
                         SelectionEffects::no_scroll(),
                         window,
                         cx,
-                        |selections| {
-                            selections.select_ranges([
-                                multi_buffer::Anchor::Min..multi_buffer::Anchor::Min
-                            ])
-                        },
+                        |selections| selections.select_ranges([position..position]),
                     );
                 }
                 if is_excerpt_newly_added

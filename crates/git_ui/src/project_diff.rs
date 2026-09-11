@@ -1936,9 +1936,17 @@ mod tests {
             &editor,
             cx,
             &"
-                  ˇnine
+                  one
+                  two
+                  three
+                  four
+                  five
+                  six
+                  seven
+                  eight
+                  nine
                   ten
-                - eleven
+                - ˇeleven
                 + ELEVEN
                   twelve
             "
@@ -1989,9 +1997,12 @@ mod tests {
                   three
                   four
                   five
-                  ˇnine
+                  six
+                  seven
+                  eight
+                  nine
                   ten
-                - eleven
+                - ˇeleven
                 + ELEVEN
                   twelve
             "
@@ -2171,13 +2182,17 @@ mod tests {
 
         let mut cx = EditorTestContext::for_editor_in(editor, cx).await;
 
-        cx.assert_excerpts_with_selections(&format!("[EXCERPT]\nˇ{git_contents}"));
+        let expected_excerpts = format!(
+            "[EXCERPT]\n{}",
+            git_contents.replacen("    let x", "ˇ    let x", 1)
+        );
+        cx.assert_excerpts_with_selections(&expected_excerpts);
 
         cx.dispatch_action(editor::actions::GoToHunk);
         cx.dispatch_action(editor::actions::GoToHunk);
         cx.dispatch_action(git::Restore);
         cx.dispatch_action(editor::actions::MoveToBeginning);
 
-        cx.assert_excerpts_with_selections(&format!("[EXCERPT]\nˇ{git_contents}"));
+        cx.assert_excerpts_with_selections(&expected_excerpts);
     }
 }
