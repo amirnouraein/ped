@@ -16,12 +16,6 @@ use crate::{
     zeta,
 };
 
-// High effort requests send nearly the whole file as extra context so the model
-// can reason about code far from the cursor, while the editable window stays the
-// same size. The context is still bounded to keep enormous files from producing
-// prompts the server would reject.
-const HIGH_EFFORT_CONTEXT_LINES_ABOVE: u32 = 2000;
-const HIGH_EFFORT_CONTEXT_LINES_BELOW: u32 = 2000;
 const HIGH_EFFORT: &str = "high";
 const MAX_RECENT_CHANGE_BLOCKS: usize = 3;
 const MAX_RECENT_CHANGE_LINES: usize = 40;
@@ -95,15 +89,9 @@ pub fn request_prediction(
     let cursor_point = position.to_point(&snapshot);
     let window_range =
         fixed_line_window_around_cursor(&snapshot, cursor_point, window_lines, window_lines);
-    let file_context = is_high_effort.then(|| {
-        let context_range = fixed_line_window_around_cursor(
-            &snapshot,
-            cursor_point,
-            HIGH_EFFORT_CONTEXT_LINES_ABOVE,
-            HIGH_EFFORT_CONTEXT_LINES_BELOW,
-        );
-        snapshot.text_for_range(context_range).collect::<String>()
-    });
+    let file_context = is_high_effort
+        .then(|| enclosing_signatures(&snapshot, cursor_point, &window_range))
+        .filter(|signatures| !signatures.is_empty());
     let file_path = prompt_file_path(&snapshot);
     let filtered_related_files = filter_redundant_excerpts(
         related_files,
@@ -364,6 +352,41 @@ fn prompt_file_path(snapshot: &BufferSnapshot) -> Arc<Path> {
         .file()
         .map(|file| Arc::<Path>::from(file.path().as_std_path()))
         .unwrap_or_else(|| Path::new("untitled").into())
+}
+
+/// Collects the signatures of the outline items enclosing the cursor (for example the
+/// containing function and its `impl` block) so the model sees how the code being
+/// edited is declared, even when the declaration lies outside the editable window.
+fn enclosing_signatures(
+    snapshot: &BufferSnapshot,
+    cursor_point: Point,
+    window_range: &Range<Point>,
+) -> String {
+    let cursor_offset = cursor_point.to_offset(snapshot);
+    let window_offsets = window_range.to_offset(snapshot);
+    let mut signatures = Vec::new();
+    for item in
+        snapshot.outline_items_as_offsets_containing(cursor_offset..cursor_offset, false, None)
+    {
+        let signature_end = item
+            .body_range(snapshot)
+            .map_or(item.range.end, |body_range| {
+                body_range.start.to_offset(snapshot)
+            });
+        let signature_range = item.range.start..signature_end;
+        // The window already contains anything declared inside it.
+        if window_offsets.start <= signature_range.start
+            && signature_range.end <= window_offsets.end
+        {
+            continue;
+        }
+        let signature: String = snapshot.text_for_range(signature_range).collect();
+        let signature = signature.trim_end();
+        if !signature.is_empty() {
+            signatures.push(signature.to_string());
+        }
+    }
+    signatures.join("\n")
 }
 
 fn write_file_block(prompt: &mut String, path: &Path, content: &str) {

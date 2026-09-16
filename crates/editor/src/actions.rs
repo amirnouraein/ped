@@ -842,7 +842,7 @@ actions!(
         ShowCharacterPalette,
         /// Shows edit prediction at cursor.
         ShowEditPrediction,
-        /// Requests a high effort edit prediction at cursor, sending most of the file as extra context.
+        /// Requests a high effort edit prediction at cursor, sending the signatures of the enclosing declarations as extra context.
         TriggerHighEffortEditPrediction,
         /// Shows signature help for the current function.
         ShowSignatureHelp,
