@@ -955,6 +955,16 @@ impl ThreadView {
             }
         }
 
+        // Route lists load asynchronously in the provider, so re-render when it updates.
+        subscriptions.push(cx.subscribe(
+            &LanguageModelRegistry::global(cx),
+            |_this, _registry, event: &language_model::Event, cx| {
+                if matches!(event, language_model::Event::ProviderStateChanged(_)) {
+                    cx.notify();
+                }
+            },
+        ));
+
         subscriptions.push(cx.observe(&message_editor, |this, editor, cx| {
             let is_empty = editor.read(cx).text(cx).is_empty();
             let draft_contents_task = if is_empty {
@@ -4456,7 +4466,8 @@ impl ThreadView {
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
                                     .children(self.render_fast_mode_control(cx))
-                                    .children(self.render_thinking_control(cx)),
+                                    .children(self.render_thinking_control(cx))
+                                    .children(self.render_route_selector(cx)),
                             )
                             .child(
                                 h_flex()
@@ -5251,6 +5262,98 @@ impl ThreadView {
         Some(
             SplitButton::new(left_btn, right_btn.into_any_element())
                 .style(SplitButtonStyle::Transparent)
+                .into_any_element(),
+        )
+    }
+
+    fn render_route_selector(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let model = self.as_native_thread(cx)?.read(cx).model()?.clone();
+        if !model.supports_route_selection() {
+            return None;
+        }
+        model.refresh_routes(cx);
+
+        let routes = model.available_routes(cx);
+        let selected = model.selected_route(cx);
+        let label: SharedString = selected
+            .as_ref()
+            .and_then(|selected| routes.iter().find(|route| &route.id == selected))
+            .map(|route| route.name.clone())
+            .or_else(|| selected.clone())
+            .unwrap_or_else(|| "Auto".into());
+
+        let trigger = ButtonLike::new("route-selector-trigger").child(
+            h_flex()
+                .gap_1()
+                .child(
+                    Icon::new(IconName::Server)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                ),
+        );
+
+        Some(
+            PopoverMenu::new("route-selector")
+                .trigger_with_tooltip(
+                    trigger.selected_style(ButtonStyle::Tinted(TintColor::Accent)),
+                    Tooltip::text("Choose which provider serves this model"),
+                )
+                .menu(move |window, cx| {
+                    let model = model.clone();
+                    let routes = routes.clone();
+                    let selected = selected.clone();
+                    Some(ContextMenu::build(
+                        window,
+                        cx,
+                        move |mut menu, _window, _cx| {
+                            menu = menu.header("Provider");
+                            menu.push_item(
+                                ContextMenuEntry::new("Auto")
+                                    .toggleable(IconPosition::End, selected.is_none())
+                                    .handler({
+                                        let model = model.clone();
+                                        move |_window, cx| model.set_selected_route(None, cx)
+                                    }),
+                            );
+                            if routes.is_empty() {
+                                menu.push_item(
+                                    ContextMenuEntry::new("Loading providers…").disabled(true),
+                                );
+                            }
+                            for route in routes {
+                                let is_selected = selected.as_ref() == Some(&route.id);
+                                let label = if route.tags.is_empty() {
+                                    route.name.to_string()
+                                } else {
+                                    format!("{} · {}", route.name, route.tags.join(" · "))
+                                };
+                                menu.push_item(
+                                    ContextMenuEntry::new(label)
+                                        .toggleable(IconPosition::End, is_selected)
+                                        .handler({
+                                            let model = model.clone();
+                                            let route_id = route.id.clone();
+                                            move |_window, cx| {
+                                                model.set_selected_route(Some(route_id.clone()), cx)
+                                            }
+                                        }),
+                                );
+                            }
+                            menu
+                        },
+                    ))
+                })
+                .offset(gpui::Point {
+                    x: px(0.0),
+                    y: px(-2.0),
+                })
+                .anchor(gpui::Anchor::BottomLeft)
                 .into_any_element(),
         )
     }

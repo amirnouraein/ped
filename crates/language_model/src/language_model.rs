@@ -161,6 +161,26 @@ pub trait LanguageModel: Send + Sync {
             .find(|effort_level| effort_level.is_default)
     }
 
+    /// Whether the user can choose which upstream endpoint serves this model.
+    fn supports_route_selection(&self) -> bool {
+        false
+    }
+
+    /// The endpoints known for this model. Empty until `refresh_routes` has loaded them.
+    fn available_routes(&self, _cx: &App) -> Vec<LanguageModelRoute> {
+        Vec::new()
+    }
+
+    /// Starts loading the routes for this model if they are not already loaded.
+    fn refresh_routes(&self, _cx: &mut App) {}
+
+    /// The id of the route the user selected, or `None` for the gateway's default routing.
+    fn selected_route(&self, _cx: &App) -> Option<SharedString> {
+        None
+    }
+
+    fn set_selected_route(&self, _route: Option<SharedString>, _cx: &mut App) {}
+
     /// Whether this model supports provider-side automatic context
     /// compaction (requested via `LanguageModelRequest::compact_at_tokens`).
     fn supports_server_side_compaction(&self) -> bool {

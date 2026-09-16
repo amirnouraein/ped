@@ -1,6 +1,8 @@
 use anyhow::Result;
 
+use collections::HashMap;
 use credentials_provider::CredentialsProvider;
+use db::kvp::GlobalKeyValueStore;
 use futures::{FutureExt, StreamExt, future::BoxFuture};
 use gpui::{App, AppContext, AsyncApp, Context, Entity, SharedString, Task};
 use http_client::{CustomHeaders, HttpClient};
@@ -10,12 +12,12 @@ use language_model::{
     LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelEffortLevel,
     LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
     LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest,
-    LanguageModelToolChoice, LanguageModelToolResultContent, MessageContent, ProviderSettingsView,
-    RateLimiter, Role, env_var,
+    LanguageModelRoute, LanguageModelToolChoice, LanguageModelToolResultContent, MessageContent,
+    ProviderSettingsView, RateLimiter, Role, env_var,
 };
 use open_router::{
-    Model, ModelMode as OpenRouterModelMode, OPEN_ROUTER_API_URL, ReasoningEffort,
-    ResponseStreamEvent, list_models,
+    Model, ModelEndpoint, ModelMode as OpenRouterModelMode, OPEN_ROUTER_API_URL, ReasoningEffort,
+    ResponseStreamEvent, list_model_endpoints, list_models,
 };
 use settings::{OpenRouterAvailableModel as AvailableModel, Settings, SettingsStore};
 use sha2::{Digest as _, Sha256};
@@ -28,6 +30,7 @@ const PROVIDER_NAME: LanguageModelProviderName = LanguageModelProviderName::new(
 const API_KEY_ENV_VAR_NAME: &str = "OPENROUTER_API_KEY";
 static API_KEY_ENV_VAR: LazyLock<EnvVar> = env_var!(API_KEY_ENV_VAR_NAME);
 pub(crate) const RESERVED_HEADER_NAMES: &[&str] = &["HTTP-Referer", "X-Title"];
+const SELECTED_ROUTES_KVP_KEY: &str = "openrouter_selected_routes";
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct OpenRouterSettings {
@@ -47,9 +50,105 @@ pub struct State {
     http_client: Arc<dyn HttpClient>,
     available_models: Vec<open_router::Model>,
     fetch_models_task: Option<Task<Result<(), LanguageModelCompletionError>>>,
+    endpoints_by_model: HashMap<String, Vec<ModelEndpoint>>,
+    endpoint_fetch_tasks: HashMap<String, Task<()>>,
+    selected_routes: HashMap<String, String>,
 }
 
 impl State {
+    fn load_selected_routes() -> HashMap<String, String> {
+        match GlobalKeyValueStore::global().read_kvp(SELECTED_ROUTES_KVP_KEY) {
+            Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_else(|error| {
+                log::error!("failed to parse stored OpenRouter routes: {error}");
+                HashMap::default()
+            }),
+            Ok(None) => HashMap::default(),
+            Err(error) => {
+                log::error!("failed to read stored OpenRouter routes: {error}");
+                HashMap::default()
+            }
+        }
+    }
+
+    fn set_selected_route(
+        &mut self,
+        model_id: String,
+        route: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        match route {
+            Some(route) => {
+                self.selected_routes.insert(model_id, route);
+            }
+            None => {
+                self.selected_routes.remove(&model_id);
+            }
+        }
+        cx.notify();
+
+        let json = match serde_json::to_string(&self.selected_routes) {
+            Ok(json) => json,
+            Err(error) => {
+                log::error!("failed to serialize OpenRouter routes: {error}");
+                return;
+            }
+        };
+        cx.background_spawn(async move {
+            if let Err(error) = GlobalKeyValueStore::global()
+                .write_kvp(SELECTED_ROUTES_KVP_KEY.to_string(), json)
+                .await
+            {
+                log::error!("failed to store OpenRouter routes: {error}");
+            }
+        })
+        .detach();
+    }
+
+    fn fetch_endpoints_if_needed(&mut self, model_id: String, cx: &mut Context<Self>) {
+        if self.endpoints_by_model.contains_key(&model_id)
+            || self.endpoint_fetch_tasks.contains_key(&model_id)
+        {
+            return;
+        }
+        let http_client = self.http_client.clone();
+        let api_url = OpenRouterLanguageModelProvider::api_url(cx);
+        let extra_headers = OpenRouterLanguageModelProvider::settings(cx)
+            .custom_headers
+            .clone();
+        let Some(api_key) = self.api_key_state.key(&api_url) else {
+            return;
+        };
+        let task = cx.spawn({
+            let model_id = model_id.clone();
+            async move |this, cx| {
+                let result = list_model_endpoints(
+                    http_client.as_ref(),
+                    &api_url,
+                    &api_key,
+                    &model_id,
+                    &extra_headers,
+                )
+                .await;
+                this.update(cx, |this, cx| {
+                    this.endpoint_fetch_tasks.remove(&model_id);
+                    match result {
+                        Ok(endpoints) => {
+                            this.endpoints_by_model.insert(model_id, endpoints);
+                            cx.notify();
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "failed to fetch OpenRouter endpoints for {model_id}: {error:?}"
+                            );
+                        }
+                    }
+                })
+                .ok();
+            }
+        });
+        self.endpoint_fetch_tasks.insert(model_id, task);
+    }
+
     fn is_authenticated(&self) -> bool {
         self.api_key_state.has_key()
     }
@@ -156,6 +255,9 @@ impl OpenRouterLanguageModelProvider {
                 http_client: http_client.clone(),
                 available_models: Vec::new(),
                 fetch_models_task: None,
+                endpoints_by_model: HashMap::default(),
+                endpoint_fetch_tasks: HashMap::default(),
+                selected_routes: State::load_selected_routes(),
             }
         });
 
@@ -373,6 +475,42 @@ impl LanguageModel for OpenRouterLanguageModel {
         !self.model.mandatory_reasoning
     }
 
+    fn supports_route_selection(&self) -> bool {
+        // The auto router picks the model itself, so its endpoints are not meaningful.
+        self.model.id() != open_router::Model::default().id()
+    }
+
+    fn available_routes(&self, cx: &App) -> Vec<LanguageModelRoute> {
+        self.state
+            .read(cx)
+            .endpoints_by_model
+            .get(self.model.id())
+            .map(|endpoints| endpoints.iter().map(route_from_endpoint).collect())
+            .unwrap_or_default()
+    }
+
+    fn refresh_routes(&self, cx: &mut App) {
+        let model_id = self.model.id().to_string();
+        self.state.update(cx, |state, cx| {
+            state.fetch_endpoints_if_needed(model_id, cx);
+        });
+    }
+
+    fn selected_route(&self, cx: &App) -> Option<SharedString> {
+        self.state
+            .read(cx)
+            .selected_routes
+            .get(self.model.id())
+            .map(|route| route.clone().into())
+    }
+
+    fn set_selected_route(&self, route: Option<SharedString>, cx: &mut App) {
+        let model_id = self.model.id().to_string();
+        self.state.update(cx, |state, cx| {
+            state.set_selected_route(model_id, route.map(|route| route.to_string()), cx);
+        });
+    }
+
     fn supported_effort_levels(&self) -> Vec<LanguageModelEffortLevel> {
         let efforts: &[ReasoningEffort] = if !self.model.supported_efforts.is_empty() {
             &self.model.supported_efforts
@@ -434,11 +572,17 @@ impl LanguageModel for OpenRouterLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
-        let openrouter_request =
+        let mut openrouter_request =
             match into_open_router(request, &self.model, self.max_output_tokens()) {
                 Ok(request) => request,
                 Err(error) => return async move { Err(error.into()) }.boxed(),
             };
+        let selected_route = self.state.read_with(cx, |state, _cx| {
+            state.selected_routes.get(self.model.id()).cloned()
+        });
+        if let Some(route) = selected_route {
+            openrouter_request.provider = Some(open_router::Provider::for_endpoint(route));
+        }
         let request = self.stream_completion(openrouter_request, cx);
         let executor = cx.background_executor().clone();
         let future = self.request_limiter.stream(async move {
@@ -450,6 +594,34 @@ impl LanguageModel for OpenRouterLanguageModel {
             ))
         });
         async move { Ok(future.await?.boxed()) }.boxed()
+    }
+}
+
+fn route_from_endpoint(endpoint: &ModelEndpoint) -> LanguageModelRoute {
+    let id = endpoint
+        .tag
+        .clone()
+        .unwrap_or_else(|| endpoint.provider_name.clone());
+    let mut tags = Vec::new();
+    if let Some(quantization) = &endpoint.quantization {
+        tags.push(SharedString::from(quantization.clone()));
+    }
+    if let Some(context_length) = endpoint.context_length {
+        tags.push(SharedString::from(format!(
+            "{}K ctx",
+            context_length / 1000
+        )));
+    }
+    if let Some(uptime) = endpoint.uptime_last_30m {
+        tags.push(SharedString::from(format!("{uptime:.0}% uptime")));
+    }
+    if endpoint.status.is_some_and(|status| status < 0) {
+        tags.push(SharedString::from("degraded"));
+    }
+    LanguageModelRoute {
+        id: id.into(),
+        name: endpoint.provider_name.clone().into(),
+        tags,
     }
 }
 

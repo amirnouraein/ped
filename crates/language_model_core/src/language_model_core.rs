@@ -681,6 +681,14 @@ pub struct LanguageModelEffortLevel {
     pub is_default: bool,
 }
 
+/// A concrete upstream endpoint that a gateway can route a model's requests to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LanguageModelRoute {
+    pub id: SharedString,
+    pub name: SharedString,
+    pub tags: Vec<SharedString>,
+}
+
 /// An error that occurred when trying to authenticate the language model provider.
 #[derive(Debug, Error)]
 pub enum AuthenticateError {

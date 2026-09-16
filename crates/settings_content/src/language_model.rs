@@ -610,6 +610,23 @@ pub struct OpenRouterProvider {
     sort: Option<String>,
 }
 
+impl OpenRouterProvider {
+    /// Pins requests to a single OpenRouter endpoint, identified by its provider
+    /// slug or endpoint tag (for example `deepinfra` or `deepinfra/fp8`).
+    pub fn for_endpoint(endpoint: String) -> Self {
+        Self {
+            order: Some(vec![endpoint]),
+            allow_fallbacks: false,
+            require_parameters: false,
+            data_collection: DataCollection::default(),
+            only: None,
+            ignore: None,
+            quantizations: None,
+            sort: None,
+        }
+    }
+}
+
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 #[serde(rename_all = "lowercase")]
 pub enum DataCollection {
