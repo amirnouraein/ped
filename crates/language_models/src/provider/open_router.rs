@@ -598,6 +598,8 @@ impl LanguageModel for OpenRouterLanguageModel {
 }
 
 fn route_from_endpoint(endpoint: &ModelEndpoint) -> LanguageModelRoute {
+    // The tag is the full routing slug including tier segments (for example
+    // `google-ai-studio/priority`), which is what users need to tell tiers apart.
     let id = endpoint
         .tag
         .clone()
@@ -619,8 +621,8 @@ fn route_from_endpoint(endpoint: &ModelEndpoint) -> LanguageModelRoute {
         tags.push(SharedString::from("degraded"));
     }
     LanguageModelRoute {
+        name: id.clone().into(),
         id: id.into(),
-        name: endpoint.provider_name.clone().into(),
         tags,
     }
 }

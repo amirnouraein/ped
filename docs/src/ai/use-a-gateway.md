@@ -42,7 +42,7 @@ The `openrouter/auto` model routes requests to an available model selected by Op
 
 ### Choosing a Provider {#openrouter-providers}
 
-Most OpenRouter models are served by several upstream providers, and throughput can differ a lot between them. When an OpenRouter model is active, the agent panel shows a provider dropdown next to the thinking controls. It lists every endpoint OpenRouter offers for the model, along with its quantization, context length, and recent uptime. Pick one to pin requests to that provider, or choose **Auto** to let OpenRouter route each request. The choice is remembered per model.
+Most OpenRouter models are served by several upstream providers, and throughput can differ a lot between them. When an OpenRouter model is active, the agent panel shows a provider dropdown next to the thinking controls. It lists every endpoint OpenRouter offers for the model by its full routing slug, including tier segments such as `google-ai-studio/priority` or `xai/zdr/priority`, along with its quantization, context length, and recent uptime. Pick one to pin requests to that provider, or choose **Auto** to let OpenRouter route each request. The choice is remembered per model.
 
 ### OpenRouter Custom Models {#openrouter-custom-models}
 
