@@ -24,7 +24,6 @@ const RESERVED_SWEEP_TOKENS: [&str; 2] = ["<|file_sep|>", "</s>"];
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SweepPromptInput {
     pub file_path: Arc<Path>,
-    pub file_context: Option<String>,
     pub original_window: String,
     pub current_window: String,
     pub include_current_window: bool,
@@ -90,9 +89,6 @@ pub fn request_prediction(
     let cursor_point = position.to_point(&snapshot);
     let window_range =
         fixed_line_window_around_cursor(&snapshot, cursor_point, window_lines, window_lines);
-    let file_context = is_high_effort
-        .then(|| enclosing_signatures(&snapshot, cursor_point, &window_range))
-        .filter(|signatures| !signatures.is_empty());
     let file_path = prompt_file_path(&snapshot);
     let filtered_related_files = filter_redundant_excerpts(
         related_files,
@@ -101,7 +97,6 @@ pub fn request_prediction(
     );
     let prompt_input = build_prompt_input(
         &file_path,
-        file_context,
         !is_high_effort,
         window_range.clone(),
         &snapshot,
@@ -227,10 +222,6 @@ pub fn build_prompt(input: &SweepPromptInput) -> String {
         );
     }
 
-    if let Some(file_context) = &input.file_context {
-        write_file_block(&mut prompt, input.file_path.as_ref(), file_context);
-    }
-
     for recent_change in &input.recent_changes {
         let diff_path = format!("{}.diff", recent_change.file_path.display());
         let mut diff_body = String::new();
@@ -264,9 +255,6 @@ pub fn build_prompt(input: &SweepPromptInput) -> String {
 
 fn validate_prompt_input(input: &SweepPromptInput) -> Result<()> {
     validate_prompt_field("file path", &input.file_path.display().to_string())?;
-    if let Some(file_context) = &input.file_context {
-        validate_prompt_field("file context", file_context)?;
-    }
     validate_prompt_field("original window", &input.original_window)?;
     validate_prompt_field("current window", &input.current_window)?;
 
@@ -325,7 +313,6 @@ pub(crate) fn original_window_for_current_window(
 
 fn build_prompt_input(
     file_path: &Arc<Path>,
-    file_context: Option<String>,
     include_current_window: bool,
     window_range: Range<Point>,
     snapshot: &BufferSnapshot,
@@ -344,7 +331,6 @@ fn build_prompt_input(
 
     SweepPromptInput {
         file_path: file_path.clone(),
-        file_context,
         original_window,
         current_window,
         include_current_window,
@@ -358,40 +344,6 @@ fn prompt_file_path(snapshot: &BufferSnapshot) -> Arc<Path> {
         .file()
         .map(|file| Arc::<Path>::from(file.path().as_std_path()))
         .unwrap_or_else(|| Path::new("untitled").into())
-}
-
-/// Collects the signatures of the outline items enclosing the cursor (for example the
-/// containing function and its `impl` block) so the model sees how the code being
-/// edited is declared, even when the declaration lies outside the editable window.
-fn enclosing_signatures(
-    snapshot: &BufferSnapshot,
-    cursor_point: Point,
-    window_range: &Range<Point>,
-) -> String {
-    let cursor_offset = cursor_point.to_offset(snapshot);
-    let window_offsets = window_range.to_offset(snapshot);
-    let mut signatures = Vec::new();
-    for item in
-        snapshot.outline_items_as_offsets_containing(cursor_offset..cursor_offset, false, None)
-    {
-        let signature_end = edit_prediction_context::outline_item_body_range(&item, snapshot)
-            .map_or(item.range.end, |body_range| {
-                body_range.start.to_offset(snapshot)
-            });
-        let signature_range = item.range.start..signature_end;
-        // The window already contains anything declared inside it.
-        if window_offsets.start <= signature_range.start
-            && signature_range.end <= window_offsets.end
-        {
-            continue;
-        }
-        let signature: String = snapshot.text_for_range(signature_range).collect();
-        let signature = signature.trim_end();
-        if !signature.is_empty() {
-            signatures.push(signature.to_string());
-        }
-    }
-    signatures.join("\n")
 }
 
 fn write_file_block(prompt: &mut String, path: &Path, content: &str) {
@@ -581,7 +533,6 @@ mod tests {
     fn test_build_prompt_uses_run_model_ordering() {
         let prompt = build_prompt(&SweepPromptInput {
             file_path: Path::new("src/main.rs").into(),
-            file_context: None,
             original_window: "old window".to_string(),
             current_window: "current window".to_string(),
             include_current_window: true,
