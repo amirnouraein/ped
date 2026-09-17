@@ -374,8 +374,7 @@ fn enclosing_signatures(
     for item in
         snapshot.outline_items_as_offsets_containing(cursor_offset..cursor_offset, false, None)
     {
-        let signature_end = item
-            .body_range(snapshot)
+        let signature_end = edit_prediction_context::outline_item_body_range(&item, snapshot)
             .map_or(item.range.end, |body_range| {
                 body_range.start.to_offset(snapshot)
             });

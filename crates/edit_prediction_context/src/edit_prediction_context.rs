@@ -5,7 +5,10 @@ use futures::{FutureExt, StreamExt as _, channel::mpsc, future};
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EntityId, EventEmitter, Task, TaskExt, WeakEntity,
 };
-use language::{Anchor, Bias, Buffer, BufferSnapshot, OffsetRangeExt as _, Point, ToOffset as _};
+use language::{
+    Anchor, Bias, Buffer, BufferSnapshot, OffsetRangeExt as _, OutlineItem, Point, ToOffset as _,
+    ToPoint as _,
+};
 use project::{EditPredictionDefinition, Project, ProjectPath};
 use smallvec::SmallVec;
 use std::{
@@ -593,7 +596,46 @@ impl RelatedBuffer {
     }
 }
 
-use language::ToPoint as _;
+/// Returns the body of an outline item, preferring the `function.inside` text object over the
+/// outline's own indentation-based guess. Outline queries for most languages don't mark where a
+/// body starts, and the indentation guess treats indented parameter lines of declarations like
+/// `const f = async (\n  a,\n) => {` as body, which drops the parameters from excerpts.
+pub fn outline_item_body_range<T: language::ToOffset + language::ToPoint>(
+    item: &OutlineItem<T>,
+    snapshot: &BufferSnapshot,
+) -> Option<Range<Point>> {
+    if item.body_range.is_some() {
+        return item.body_range(snapshot);
+    }
+
+    let item_range = item.range.to_offset(snapshot);
+    let body_range = snapshot
+        .function_body_fold_ranges(item_range.clone())
+        .filter(|range| item_range.start <= range.start && range.end <= item_range.end)
+        .min_by_key(|range| (range.start, std::cmp::Reverse(range.end)));
+    let Some(body_range) = body_range else {
+        return item.body_range(snapshot);
+    };
+
+    let mut start = body_range.start.to_point(snapshot);
+    let mut end = body_range.end.to_point(snapshot);
+    // The text object spans the body's statements. Widen it to the surrounding line
+    // boundaries so the head keeps the opening line and the tail keeps the closing line,
+    // matching what `@open`/`@close` outline captures produce.
+    let leading_is_blank = snapshot
+        .text_for_range(Point::new(start.row, 0)..start)
+        .all(|chunk| chunk.trim().is_empty());
+    if leading_is_blank && start.row > 0 {
+        start = Point::new(start.row - 1, snapshot.line_len(start.row - 1));
+    }
+    let trailing_is_blank = snapshot
+        .text_for_range(end..Point::new(end.row, snapshot.line_len(end.row)))
+        .all(|chunk| chunk.trim().is_empty());
+    if trailing_is_blank && end.row < snapshot.max_point().row {
+        end = Point::new(end.row + 1, 0);
+    }
+    if start < end { Some(start..end) } else { None }
+}
 
 const MAX_TARGET_LEN: usize = 128;
 
@@ -650,7 +692,7 @@ fn identifiers_for_position(
     // Search for identifiers mentioned in headers/signatures of containing outline items.
     let outline_items = buffer.outline_items_as_offsets_containing(offset..offset, false, None);
     for item in outline_items {
-        if let Some(body_range) = item.body_range(&buffer) {
+        if let Some(body_range) = outline_item_body_range(&item, &buffer) {
             ranges.push(item.range.start..body_range.start.to_offset(&buffer));
         } else {
             ranges.push(item.range.clone());
