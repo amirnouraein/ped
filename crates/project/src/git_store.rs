@@ -1004,6 +1004,18 @@ impl GitStore {
             this.activate_parked_repositories_where_parking_disabled(cx);
         }));
 
+        _subscriptions.push(cx.observe_global::<buffer_diff::IgnoreWhitespaceInDiffs>(
+            |this, cx| {
+                let buffers = this
+                    .diffs
+                    .keys()
+                    .filter_map(|buffer_id| this.buffer_store.read(cx).get(*buffer_id))
+                    .collect();
+                let recalculation = this.recalculate_buffer_diffs(buffers, cx);
+                cx.background_spawn(recalculation).detach();
+            },
+        ));
+
         let diff_base_setting = ProjectSettings::get_global(cx).git.diff_base;
         GitStore {
             state,
