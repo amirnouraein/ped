@@ -27,6 +27,7 @@ pub struct SweepPromptInput {
     pub file_context: Option<String>,
     pub original_window: String,
     pub current_window: String,
+    pub include_current_window: bool,
     pub recent_changes: Vec<RecentChangeBlock>,
     pub related_files: Vec<RelatedFileBlock>,
 }
@@ -101,6 +102,7 @@ pub fn request_prediction(
     let prompt_input = build_prompt_input(
         &file_path,
         file_context,
+        !is_high_effort,
         window_range.clone(),
         &snapshot,
         &stored_events,
@@ -249,8 +251,10 @@ pub fn build_prompt(input: &SweepPromptInput) -> String {
         &input.original_window,
     );
 
-    let current_path = format!("current/{}", input.file_path.display());
-    write_file_block(&mut prompt, Path::new(&current_path), &input.current_window);
+    if input.include_current_window {
+        let current_path = format!("current/{}", input.file_path.display());
+        write_file_block(&mut prompt, Path::new(&current_path), &input.current_window);
+    }
 
     let updated_path = format!("updated/{}", input.file_path.display());
     writeln!(&mut prompt, "<|file_sep|>{updated_path}").ok();
@@ -322,6 +326,7 @@ pub(crate) fn original_window_for_current_window(
 fn build_prompt_input(
     file_path: &Arc<Path>,
     file_context: Option<String>,
+    include_current_window: bool,
     window_range: Range<Point>,
     snapshot: &BufferSnapshot,
     stored_events: &[StoredEvent],
@@ -342,6 +347,7 @@ fn build_prompt_input(
         file_context,
         original_window,
         current_window,
+        include_current_window,
         recent_changes: build_recent_change_blocks(stored_events),
         related_files: build_related_file_blocks(related_files),
     }
@@ -579,6 +585,7 @@ mod tests {
             file_context: None,
             original_window: "old window".to_string(),
             current_window: "current window".to_string(),
+            include_current_window: true,
             recent_changes: vec![RecentChangeBlock {
                 file_path: Path::new("src/lib.rs").into(),
                 original: "old".to_string(),
