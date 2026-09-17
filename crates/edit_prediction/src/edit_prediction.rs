@@ -3121,9 +3121,19 @@ impl EditPredictionStore {
         cursor_position: language::Anchor,
         cx: &mut Context<Self>,
     ) {
+        let settings = &all_language_settings(None, cx).edit_predictions;
+        let sweep_window_lines = match settings.provider {
+            EditPredictionProvider::Ollama => settings.ollama.as_ref(),
+            EditPredictionProvider::OpenAiCompatibleApi => settings.open_ai_compatible_api.as_ref(),
+            _ => None,
+        }
+        .map(|custom_settings| custom_settings.sweep_window_lines);
         self.get_or_init_project(project, cx)
             .context
             .update(cx, |store, cx| {
+                if let Some(sweep_window_lines) = sweep_window_lines {
+                    store.set_usage_exclusion_line_count(sweep_window_lines);
+                }
                 store.refresh(buffer.clone(), cursor_position, cx);
             });
     }

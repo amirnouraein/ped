@@ -40,6 +40,11 @@ pub use zeta_prompt::{ContextSource, RelatedExcerpt, RelatedFile};
 
 const IDENTIFIER_LINE_COUNT: u32 = 3;
 const MAX_CONTEXT_IDENTIFIER_COUNT: usize = 32;
+const MAX_USAGES_PER_IDENTIFIER: usize = 5;
+// Calls often spread their arguments over the following lines, so usages keep a
+// little more context below than above.
+const USAGE_CONTEXT_LINES_ABOVE: u32 = 1;
+const USAGE_CONTEXT_LINES_BELOW: u32 = 3;
 
 pub struct RelatedExcerptStore {
     project: WeakEntity<Project>,
@@ -47,6 +52,7 @@ pub struct RelatedExcerptStore {
     cache: HashMap<Identifier, Arc<CacheEntry>>,
     update_tx: mpsc::UnboundedSender<(Entity<Buffer>, Anchor)>,
     identifier_line_count: u32,
+    usage_exclusion_line_count: u32,
 }
 
 struct RelatedBuffer {
@@ -89,6 +95,14 @@ enum DefinitionTask {
 #[derive(Debug)]
 struct CacheEntry {
     definitions: SmallVec<[CachedDefinition; 1]>,
+}
+
+/// The buffer being edited, scanned for other usages of the identifiers near the cursor.
+struct CurrentBuffer {
+    buffer: Entity<Buffer>,
+    path: ProjectPath,
+    position: Anchor,
+    usage_exclusion_line_count: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -136,11 +150,18 @@ impl RelatedExcerptStore {
             related_buffers: Vec::new(),
             cache: Default::default(),
             identifier_line_count: IDENTIFIER_LINE_COUNT,
+            usage_exclusion_line_count: IDENTIFIER_LINE_COUNT,
         }
     }
 
     pub fn set_identifier_line_count(&mut self, count: u32) {
         self.identifier_line_count = count;
+    }
+
+    /// Usages within this many lines of the cursor are skipped, because the prompt's
+    /// editable window already shows them.
+    pub fn set_usage_exclusion_line_count(&mut self, count: u32) {
+        self.usage_exclusion_line_count = count;
     }
 
     pub fn refresh(&mut self, buffer: Entity<Buffer>, position: Anchor, _: &mut Context<Self>) {
@@ -215,27 +236,39 @@ impl RelatedExcerptStore {
         position: Anchor,
         cx: &mut AsyncApp,
     ) -> Result<()> {
-        let (project, snapshot, file_extension, identifier_line_count) =
-            this.read_with(cx, |this, cx| {
-                let snapshot = buffer.read(cx).snapshot();
-                let file_extension = snapshot
-                    .file()
-                    .and_then(|file| {
-                        Some(
-                            Path::new(file.file_name(cx))
-                                .extension()?
-                                .to_string_lossy()
-                                .into_owned(),
-                        )
-                    })
-                    .unwrap_or_default();
-                (
-                    this.project.upgrade(),
-                    snapshot,
-                    file_extension,
-                    this.identifier_line_count,
-                )
-            })?;
+        let (
+            project,
+            snapshot,
+            file_extension,
+            identifier_line_count,
+            usage_exclusion_line_count,
+            current_path,
+        ) = this.read_with(cx, |this, cx| {
+            let snapshot = buffer.read(cx).snapshot();
+            let current_path = snapshot.file().map(|file| ProjectPath {
+                worktree_id: file.worktree_id(cx),
+                path: file.path().clone(),
+            });
+            let file_extension = snapshot
+                .file()
+                .and_then(|file| {
+                    Some(
+                        Path::new(file.file_name(cx))
+                            .extension()?
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
+                .unwrap_or_default();
+            (
+                this.project.upgrade(),
+                snapshot,
+                file_extension,
+                this.identifier_line_count,
+                this.usage_exclusion_line_count,
+                current_path,
+            )
+        })?;
         let Some(project) = project else {
             return Ok(());
         };
@@ -393,8 +426,15 @@ impl RelatedExcerptStore {
         let lsp_fetch_latency_ms = start_time.elapsed().as_millis();
         mean_definition_latency /= cache_miss_count.max(1) as u32;
 
+        let current_buffer = current_path.map(|path| CurrentBuffer {
+            buffer: buffer.clone(),
+            path,
+            position,
+            usage_exclusion_line_count,
+        });
         let (new_cache, related_buffers) =
-            rebuild_related_files(&project, new_cache, &cursor_distances, cx).await?;
+            rebuild_related_files(&project, new_cache, &cursor_distances, current_buffer, cx)
+                .await?;
         let latency_ms = start_time.elapsed().as_millis();
         let returned_excerpt_count = related_buffers
             .iter()
@@ -437,10 +477,32 @@ async fn rebuild_related_files(
     project: &Entity<Project>,
     mut new_entries: HashMap<Identifier, Arc<CacheEntry>>,
     cursor_distances: &HashMap<Identifier, usize>,
+    current_buffer: Option<CurrentBuffer>,
     cx: &mut AsyncApp,
 ) -> Result<(HashMap<Identifier, Arc<CacheEntry>>, Vec<RelatedBuffer>)> {
     let mut snapshots = HashMap::default();
     let mut worktree_root_names = HashMap::default();
+    if let Some(current_buffer) = &current_buffer {
+        current_buffer
+            .buffer
+            .read_with(cx, |buffer, _| buffer.parsing_idle())
+            .await;
+        snapshots.insert(
+            current_buffer.buffer.entity_id(),
+            current_buffer
+                .buffer
+                .read_with(cx, |buffer, _| buffer.snapshot()),
+        );
+        let worktree_id = current_buffer.path.worktree_id;
+        project.read_with(cx, |project, cx| {
+            if let Some(worktree) = project.worktree_for_id(worktree_id, cx) {
+                worktree_root_names.insert(
+                    worktree_id,
+                    worktree.read(cx).root_name().as_unix_str().to_string(),
+                );
+            }
+        });
+    }
     for entry in new_entries.values() {
         for definition in entry.definitions.iter() {
             if let hash_map::Entry::Vacant(e) = snapshots.entry(definition.buffer.entity_id()) {
@@ -495,6 +557,30 @@ async fn rebuild_related_files(
                         .or_insert_with(|| (definition.buffer.clone(), Vec::new()))
                         .1
                         .push((definition.anchor_range.to_point(snapshot), rank));
+                }
+            }
+
+            if let Some(current_buffer) = &current_buffer
+                && let Some(snapshot) = snapshots.get(&current_buffer.buffer.entity_id())
+            {
+                let usage_ranges = usage_ranges_for_identifiers(
+                    snapshot,
+                    current_buffer,
+                    &new_entries,
+                    &cursor_distances,
+                );
+                if !usage_ranges.is_empty() {
+                    let buffer_id = current_buffer.buffer.entity_id();
+                    paths_by_buffer.insert(buffer_id, current_buffer.path.clone());
+                    let buffer_rank = min_rank_by_buffer.entry(buffer_id).or_insert(usize::MAX);
+                    for (_, rank) in &usage_ranges {
+                        *buffer_rank = (*buffer_rank).min(*rank);
+                    }
+                    ranges_by_buffer
+                        .entry(buffer_id)
+                        .or_insert_with(|| (current_buffer.buffer.clone(), Vec::new()))
+                        .1
+                        .extend(usage_ranges);
                 }
             }
 
@@ -671,6 +757,114 @@ async fn process_definition(
             anchor_range,
         })
     })
+}
+
+/// Finds other places in the current buffer where the identifiers near the cursor are used,
+/// so the model can see how a function or variable is already being called. Matching is by
+/// name, using the same syntax captures that pick identifiers near the cursor.
+fn usage_ranges_for_identifiers(
+    snapshot: &BufferSnapshot,
+    current_buffer: &CurrentBuffer,
+    entries: &HashMap<Identifier, Arc<CacheEntry>>,
+    cursor_distances: &HashMap<Identifier, usize>,
+) -> Vec<(Range<Point>, usize)> {
+    let buffer_id = current_buffer.buffer.entity_id();
+    let mut rank_by_name: HashMap<&str, usize> = HashMap::default();
+    let mut definition_rows_by_name: HashMap<&str, Vec<Range<u32>>> = HashMap::default();
+    for (identifier, entry) in entries {
+        let rank = cursor_distances
+            .get(identifier)
+            .copied()
+            .unwrap_or(usize::MAX);
+        let name_rank = rank_by_name
+            .entry(identifier.name.as_str())
+            .or_insert(usize::MAX);
+        *name_rank = (*name_rank).min(rank);
+
+        for definition in entry.definitions.iter() {
+            if definition.buffer.entity_id() == buffer_id {
+                let range = definition.anchor_range.to_point(snapshot);
+                definition_rows_by_name
+                    .entry(identifier.name.as_str())
+                    .or_default()
+                    .push(range.start.row..range.end.row + 1);
+            }
+        }
+    }
+    if rank_by_name.is_empty() {
+        return Vec::new();
+    }
+
+    let cursor_offset = current_buffer.position.to_offset(snapshot);
+    let cursor_row = snapshot.offset_to_point(cursor_offset).row;
+
+    let mut candidates_by_name: HashMap<&str, Vec<(usize, u32)>> = HashMap::default();
+    let mut captures = snapshot.captures(0..snapshot.len(), |grammar| {
+        grammar
+            .highlights_config
+            .as_ref()
+            .map(|config| &config.query)
+    });
+    while let Some(capture) = captures.peek() {
+        let node_range = capture.node.byte_range();
+        let config = captures.grammars()[capture.grammar_index]
+            .highlights_config
+            .as_ref();
+        if let Some(config) = config
+            && config.identifier_capture_indices.contains(&capture.index)
+            && !is_tsx_tag(snapshot, &capture.node)
+        {
+            let name: String = snapshot.text_for_range(node_range.clone()).collect();
+            if let Some((name, _)) = rank_by_name.get_key_value(name.as_str()) {
+                let row = snapshot.offset_to_point(node_range.start).row;
+                // Lines next to the cursor are already inside the editable window, and a
+                // definition in this buffer already has its own excerpt.
+                let is_near_cursor =
+                    row.abs_diff(cursor_row) <= current_buffer.usage_exclusion_line_count;
+                let is_definition = definition_rows_by_name
+                    .get(name)
+                    .is_some_and(|rows| rows.iter().any(|rows| rows.contains(&row)));
+                if !is_near_cursor && !is_definition {
+                    let distance = if cursor_offset < node_range.start {
+                        node_range.start - cursor_offset
+                    } else {
+                        cursor_offset.saturating_sub(node_range.end)
+                    };
+                    candidates_by_name
+                        .entry(name)
+                        .or_default()
+                        .push((distance, row));
+                }
+            }
+        }
+        captures.advance();
+    }
+
+    let max_row = snapshot.max_point().row;
+    let mut usage_ranges = Vec::new();
+    for (name, mut candidates) in candidates_by_name {
+        let Some(rank) = rank_by_name.get(name).copied() else {
+            continue;
+        };
+        candidates.sort_unstable();
+        let mut seen_rows = Vec::new();
+        for (_, row) in candidates {
+            if seen_rows.contains(&row) {
+                continue;
+            }
+            seen_rows.push(row);
+            let start_row = row.saturating_sub(USAGE_CONTEXT_LINES_ABOVE);
+            let end_row = (row + USAGE_CONTEXT_LINES_BELOW).min(max_row);
+            usage_ranges.push((
+                Point::new(start_row, 0)..Point::new(end_row, snapshot.line_len(end_row)),
+                rank,
+            ));
+            if seen_rows.len() == MAX_USAGES_PER_IDENTIFIER {
+                break;
+            }
+        }
+    }
+    usage_ranges
 }
 
 /// Gets all of the identifiers that are present in the given line, and its containing
