@@ -13,8 +13,8 @@ use crate::{
 use anyhow::Context as _;
 use collections::HashMap;
 use editor::{
-    Anchor, Editor, EditorEvent, EditorSettings, MAX_TAB_TITLE_LEN, MultiBuffer, PathKey,
-    SearchResultsStatus, SelectionEffects,
+    Anchor, Editor, EditorEvent, EditorSettings, ExcerptRange, MAX_TAB_TITLE_LEN, MultiBuffer,
+    PathKey, SearchResultsStatus, SelectionEffects,
     actions::{Backtab, FoldAll, SelectAll, Tab, UnfoldAll},
     items::active_match_index,
     multibuffer_context_lines,
@@ -23,13 +23,13 @@ use editor::{
 use file_icons::FileIcons;
 use futures::{StreamExt, stream::FuturesOrdered};
 use gpui::{
-    Action, AnyElement, App, AsyncApp, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, Global, Hsla, InteractiveElement, IntoElement, KeyContext, ParentElement, Point,
-    Render, SharedString, Styled, Subscription, Task, TaskExt, UniformListScrollHandle,
-    UpdateGlobal, WeakEntity, Window, actions, div, uniform_list,
+    Action, AnyElement, App, AsyncApp, Context, DragMoveEvent, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, Global, Hsla, InteractiveElement, IntoElement, KeyContext,
+    ParentElement, Pixels, Point, Render, SharedString, Styled, Subscription, Task, TaskExt,
+    UniformListScrollHandle, UpdateGlobal, WeakEntity, Window, actions, div, uniform_list,
 };
 use itertools::Itertools;
-use language::{Buffer, Language};
+use language::{Buffer, Capability, Language};
 use menu::Confirm;
 use multi_buffer::{self, MultiBufferRow, ToPoint as _};
 use project::{
@@ -52,8 +52,8 @@ use std::{
 };
 use text::OffsetRangeExt;
 use ui::{
-    CommonAnimationExt, HighlightedLabel, IconButtonShape, KeyBinding, ListItem, Toggleable,
-    Tooltip, WithScrollbar, prelude::*, utils::SearchInputWidth,
+    CommonAnimationExt, HighlightedLabel, IconButtonShape, KeyBinding, ListItem, ListItemSpacing,
+    Toggleable, Tooltip, WithScrollbar, prelude::*, utils::SearchInputWidth,
 };
 use util::{ResultExt as _, paths::PathMatcher};
 use workspace::{
@@ -377,10 +377,26 @@ enum SearchResultRow {
 
 /// Characters of a line kept before its match, so long lines still show the match.
 const RESULT_ROW_LEADING_CONTEXT: usize = 40;
+const RESULT_ROWS_MIN_WIDTH: Pixels = px(150.);
+const FILE_PREVIEW_MIN_WIDTH: Pixels = px(200.);
+
+struct DraggedResultRowsDivider;
+
+impl Render for DraggedResultRowsDivider {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
 
 pub struct ProjectSearchView {
     result_rows: ((usize, usize), Arc<[SearchResultRow]>),
     result_rows_scroll_handle: UniformListScrollHandle,
+    result_rows_width: Pixels,
+    /// Shows the excerpts of the active match's file only; `results_editor` keeps
+    /// every file and stays the source of truth for match navigation and replace.
+    file_preview_editor: Entity<Editor>,
+    file_preview_sync_key: Option<(usize, usize, usize)>,
+    file_preview_contents: Option<(text::BufferId, usize)>,
     pub(crate) workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     pub(crate) entity: Entity<ProjectSearch>,
@@ -1057,15 +1073,26 @@ impl Render for ProjectSearchView {
 
         if self.has_matches() {
             let row_count = self.result_rows(cx).len();
+            self.sync_file_preview(window, cx);
             h_flex()
+                .id("project-search-results")
                 .key_context(key_context)
                 .on_action(cx.listener(Self::open_text_finder))
                 .flex_1()
                 .size_full()
                 .track_focus(&self.focus_handle(cx))
+                .on_drag_move(cx.listener(
+                    |this, event: &DragMoveEvent<DraggedResultRowsDivider>, _, cx| {
+                        let max_width = (event.bounds.size.width - FILE_PREVIEW_MIN_WIDTH)
+                            .max(RESULT_ROWS_MIN_WIDTH);
+                        this.result_rows_width = (event.event.position.x - event.bounds.left())
+                            .clamp(RESULT_ROWS_MIN_WIDTH, max_width);
+                        cx.notify();
+                    },
+                ))
                 .child(
                     v_flex()
-                        .w(px(320.))
+                        .w(self.result_rows_width)
                         .h_full()
                         .flex_none()
                         .border_r_1()
@@ -1081,7 +1108,26 @@ impl Render for ProjectSearchView {
                         )
                         .vertical_scrollbar_for(&self.result_rows_scroll_handle, window, cx),
                 )
-                .child(div().flex_1().h_full().child(self.results_editor.clone()))
+                .child(
+                    div()
+                        .id("project-search-result-rows-divider")
+                        .h_full()
+                        .w(px(4.))
+                        .ml(px(-2.))
+                        .flex_none()
+                        .cursor_col_resize()
+                        .on_drag(DraggedResultRowsDivider, |_, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.new(|_| DraggedResultRowsDivider)
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .child(self.file_preview_editor.clone()),
+                )
+                .into_any_element()
         } else {
             let model = self.entity.read(cx);
 
@@ -1134,6 +1180,7 @@ impl Render for ProjectSearchView {
                         .child(heading_text)
                         .children(page_content),
                 )
+                .into_any_element()
         }
     }
 }
@@ -1598,6 +1645,21 @@ impl ProjectSearchView {
             editor.set_in_project_search(true);
             editor
         });
+        let file_preview_editor = cx.new(|cx| {
+            let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadWrite));
+            let mut editor =
+                Editor::for_multibuffer(multibuffer, Some(project.clone()), window, cx);
+            editor.set_searchable(false);
+            editor.set_in_project_search(true);
+            editor
+        });
+        subscriptions.push(cx.on_focus(
+            &file_preview_editor.focus_handle(cx),
+            window,
+            |this, _, cx| {
+                this.confirm_active_search(cx);
+            },
+        ));
         subscriptions.push(cx.observe(&results_editor, |_, _, cx| cx.emit(ViewEvent::UpdateTab)));
         subscriptions.push(
             cx.on_focus(&results_editor.focus_handle(cx), window, |this, _, cx| {
@@ -1654,7 +1716,7 @@ impl ProjectSearchView {
             cx.on_next_frame(window, |this, window, cx| {
                 if this.focus_handle.is_focused(window) {
                     if this.has_matches() {
-                        this.results_editor.focus_handle(cx).focus(window, cx);
+                        this.file_preview_editor.focus_handle(cx).focus(window, cx);
                     } else {
                         this.query_editor.focus_handle(cx).focus(window, cx);
                     }
@@ -1682,6 +1744,10 @@ impl ProjectSearchView {
         let mut this = ProjectSearchView {
             result_rows: ((usize::MAX, 0), Arc::from([])),
             result_rows_scroll_handle: UniformListScrollHandle::new(),
+            result_rows_width: px(320.),
+            file_preview_editor,
+            file_preview_sync_key: None,
+            file_preview_contents: None,
             workspace,
             focus_handle,
             replacement_editor,
@@ -2318,6 +2384,104 @@ impl ProjectSearchView {
         self.highlight_matches(&match_ranges, Some(index), cx);
     }
 
+    fn sync_file_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active_index) = self.active_match_index else {
+            return;
+        };
+        let model = self.entity.read(cx);
+        let sync_key = (model.search_id, model.match_ranges.len(), active_index);
+        if self.file_preview_sync_key == Some(sync_key) {
+            return;
+        }
+        self.file_preview_sync_key = Some(sync_key);
+
+        let multibuffer = model.excerpts.read(cx);
+        let snapshot = multibuffer.snapshot(cx);
+        let Some((buffer_snapshot, _)) = model
+            .match_ranges
+            .get(active_index)
+            .and_then(|range| snapshot.anchor_range_to_buffer_anchor_range(range.clone()))
+        else {
+            return;
+        };
+        let buffer_id = buffer_snapshot.remote_id();
+        let buffer_snapshot = buffer_snapshot.clone();
+        let mut active_file_match_index = 0;
+        let mut file_match_ranges = Vec::new();
+        for (match_index, range) in model.match_ranges.iter().enumerate() {
+            if let Some((match_buffer, range)) =
+                snapshot.anchor_range_to_buffer_anchor_range(range.clone())
+                && match_buffer.remote_id() == buffer_id
+            {
+                if match_index == active_index {
+                    active_file_match_index = file_match_ranges.len();
+                }
+                file_match_ranges.push(range);
+            }
+        }
+
+        let contents = (buffer_id, file_match_ranges.len());
+        let new_excerpts = (self.file_preview_contents != Some(contents))
+            .then(|| {
+                let path = snapshot.path_for_buffer(buffer_id)?.clone();
+                let buffer = multibuffer.buffer(buffer_id)?;
+                let excerpt_ranges = snapshot
+                    .excerpts_for_buffer(buffer_id)
+                    .map(|range| ExcerptRange {
+                        context: range.context.to_point(&buffer_snapshot),
+                        primary: range.primary.to_point(&buffer_snapshot),
+                    })
+                    .collect::<Vec<_>>();
+                Some((path, buffer, excerpt_ranges))
+            })
+            .flatten();
+        self.file_preview_contents = Some(contents);
+
+        self.file_preview_editor.update(cx, |editor, cx| {
+            if let Some((path, buffer, excerpt_ranges)) = new_excerpts {
+                editor.buffer().update(cx, |preview_multibuffer, cx| {
+                    preview_multibuffer.clear(cx);
+                    preview_multibuffer.set_excerpt_ranges_for_path(
+                        path,
+                        buffer,
+                        &buffer_snapshot,
+                        excerpt_ranges,
+                        cx,
+                    );
+                });
+            }
+
+            let preview_snapshot = editor.buffer().read(cx).snapshot(cx);
+            let preview_match_ranges = file_match_ranges
+                .into_iter()
+                .filter_map(|range| preview_snapshot.anchor_range_in_buffer(range))
+                .collect::<Vec<_>>();
+            editor.highlight_background(
+                HighlightKey::ProjectSearchView,
+                &preview_match_ranges,
+                move |index, theme| {
+                    if *index == active_file_match_index {
+                        theme.colors().search_active_match_background
+                    } else {
+                        theme.colors().search_match_background
+                    }
+                },
+                cx,
+            );
+            if let Some(range_to_select) = preview_match_ranges.get(active_file_match_index) {
+                let range_to_select = editor.range_for_match(range_to_select);
+                let autoscroll = if EditorSettings::get_global(cx).search.center_on_match {
+                    Autoscroll::center()
+                } else {
+                    Autoscroll::fit()
+                };
+                editor.change_selections(SelectionEffects::scroll(autoscroll), window, cx, |s| {
+                    s.select_ranges([range_to_select])
+                });
+            }
+        });
+    }
+
     fn result_rows(&mut self, cx: &App) -> Arc<[SearchResultRow]> {
         let model = self.entity.read(cx);
         let key = (model.search_id, model.match_ranges.len());
@@ -2423,6 +2587,7 @@ impl ProjectSearchView {
                 } => {
                     let match_index = *match_index;
                     ListItem::new(("project-search-result-row", row_index))
+                        .spacing(ListItemSpacing::Sparse)
                         .start_slot::<Icon>(
                             icon.clone()
                                 .map(|icon| Icon::from_path(icon).color(Color::Muted)),
@@ -2456,6 +2621,7 @@ impl ProjectSearchView {
                 } => {
                     let match_index = *match_index;
                     ListItem::new(("project-search-result-row", row_index))
+                        .spacing(ListItemSpacing::Sparse)
                         .indent_level(1)
                         .toggle_state(active_match_index == Some(match_index))
                         .child(
@@ -2548,7 +2714,7 @@ impl ProjectSearchView {
                 s.select_ranges([cursor..cursor])
             });
         });
-        let results_handle = self.results_editor.focus_handle(cx);
+        let results_handle = self.file_preview_editor.focus_handle(cx);
         window.focus(&results_handle, cx);
     }
 
@@ -2750,7 +2916,7 @@ impl ProjectSearchView {
     }
 
     fn move_focus_to_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.results_editor.focus_handle(cx).is_focused(window)
+        if !self.file_preview_editor.focus_handle(cx).is_focused(window)
             && !self.entity.read(cx).match_ranges.is_empty()
         {
             cx.stop_propagation();
