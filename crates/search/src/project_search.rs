@@ -20,17 +20,18 @@ use editor::{
     multibuffer_context_lines,
     scroll::Autoscroll,
 };
+use file_icons::FileIcons;
 use futures::{StreamExt, stream::FuturesOrdered};
 use gpui::{
     Action, AnyElement, App, AsyncApp, Context, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, Global, Hsla, InteractiveElement, IntoElement, KeyContext, ParentElement, Point,
-    Render, SharedString, Styled, Subscription, Task, TaskExt, UpdateGlobal, WeakEntity, Window,
-    actions, div,
+    Render, SharedString, Styled, Subscription, Task, TaskExt, UniformListScrollHandle,
+    UpdateGlobal, WeakEntity, Window, actions, div, uniform_list,
 };
 use itertools::Itertools;
 use language::{Buffer, Language};
 use menu::Confirm;
-use multi_buffer;
+use multi_buffer::{self, MultiBufferRow, ToPoint as _};
 use project::{
     Project, ProjectPath, SearchResults,
     search::{SearchInputKind, SearchQuery, SearchResult},
@@ -51,8 +52,8 @@ use std::{
 };
 use text::OffsetRangeExt;
 use ui::{
-    CommonAnimationExt, IconButtonShape, KeyBinding, Toggleable, Tooltip, prelude::*,
-    utils::SearchInputWidth,
+    CommonAnimationExt, HighlightedLabel, IconButtonShape, KeyBinding, ListItem, Toggleable,
+    Tooltip, WithScrollbar, prelude::*, utils::SearchInputWidth,
 };
 use util::{ResultExt as _, paths::PathMatcher};
 use workspace::{
@@ -359,7 +360,27 @@ enum InputPanel {
     Include,
 }
 
+enum SearchResultRow {
+    File {
+        name: SharedString,
+        directory: SharedString,
+        icon: Option<SharedString>,
+        match_index: usize,
+        match_count: usize,
+    },
+    Match {
+        match_index: usize,
+        text: SharedString,
+        highlight_indices: Vec<usize>,
+    },
+}
+
+/// Characters of a line kept before its match, so long lines still show the match.
+const RESULT_ROW_LEADING_CONTEXT: usize = 40;
+
 pub struct ProjectSearchView {
+    result_rows: ((usize, usize), Arc<[SearchResultRow]>),
+    result_rows_scroll_handle: UniformListScrollHandle,
     pub(crate) workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     pub(crate) entity: Entity<ProjectSearch>,
@@ -1030,18 +1051,37 @@ pub enum ViewEvent {
 impl EventEmitter<ViewEvent> for ProjectSearchView {}
 
 impl Render for ProjectSearchView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut key_context = KeyContext::default();
         key_context.add("ProjectSearchView");
 
         if self.has_matches() {
-            div()
+            let row_count = self.result_rows(cx).len();
+            h_flex()
                 .key_context(key_context)
                 .on_action(cx.listener(Self::open_text_finder))
                 .flex_1()
                 .size_full()
                 .track_focus(&self.focus_handle(cx))
-                .child(self.results_editor.clone())
+                .child(
+                    v_flex()
+                        .w(px(320.))
+                        .h_full()
+                        .flex_none()
+                        .border_r_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(
+                            uniform_list(
+                                "project-search-result-rows",
+                                row_count,
+                                cx.processor(Self::render_result_rows),
+                            )
+                            .size_full()
+                            .track_scroll(&self.result_rows_scroll_handle),
+                        )
+                        .vertical_scrollbar_for(&self.result_rows_scroll_handle, window, cx),
+                )
+                .child(div().flex_1().h_full().child(self.results_editor.clone()))
         } else {
             let model = self.entity.read(cx);
 
@@ -1640,6 +1680,8 @@ impl ProjectSearchView {
 
         // Check if Worktrees have all been previously indexed
         let mut this = ProjectSearchView {
+            result_rows: ((usize::MAX, 0), Arc::from([])),
+            result_rows_scroll_handle: UniformListScrollHandle::new(),
             workspace,
             focus_handle,
             replacement_editor,
@@ -2252,21 +2294,182 @@ impl ProjectSearchView {
                 )
             });
 
-            let range_to_select = match_ranges[new_index].clone();
-            self.results_editor.update(cx, |editor, cx| {
-                let range_to_select = editor.range_for_match(&range_to_select);
-                let autoscroll = if EditorSettings::get_global(cx).search.center_on_match {
-                    Autoscroll::center()
-                } else {
-                    Autoscroll::fit()
-                };
-                editor.unfold_ranges(std::slice::from_ref(&range_to_select), false, true, cx);
-                editor.change_selections(SelectionEffects::scroll(autoscroll), window, cx, |s| {
-                    s.select_ranges([range_to_select])
-                });
-            });
-            self.highlight_matches(&match_ranges, Some(new_index), cx);
+            self.activate_match(new_index, window, cx);
         }
+    }
+
+    fn activate_match(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let match_ranges = self.entity.read(cx).match_ranges.clone();
+        let Some(range_to_select) = match_ranges.get(index).cloned() else {
+            return;
+        };
+        self.results_editor.update(cx, |editor, cx| {
+            let range_to_select = editor.range_for_match(&range_to_select);
+            let autoscroll = if EditorSettings::get_global(cx).search.center_on_match {
+                Autoscroll::center()
+            } else {
+                Autoscroll::fit()
+            };
+            editor.unfold_ranges(std::slice::from_ref(&range_to_select), false, true, cx);
+            editor.change_selections(SelectionEffects::scroll(autoscroll), window, cx, |s| {
+                s.select_ranges([range_to_select])
+            });
+        });
+        self.highlight_matches(&match_ranges, Some(index), cx);
+    }
+
+    fn result_rows(&mut self, cx: &App) -> Arc<[SearchResultRow]> {
+        let model = self.entity.read(cx);
+        let key = (model.search_id, model.match_ranges.len());
+        if self.result_rows.0 == key {
+            return self.result_rows.1.clone();
+        }
+
+        let snapshot = model.excerpts.read(cx).snapshot(cx);
+        let mut rows = Vec::new();
+        let mut current_file_row = 0;
+        let mut current_buffer_id = None;
+        for (match_index, range) in model.match_ranges.iter().enumerate() {
+            let start = range.start.to_point(&snapshot);
+            let end = range.end.to_point(&snapshot);
+            let Some((buffer, _)) = snapshot.point_to_buffer_point(start) else {
+                continue;
+            };
+
+            if current_buffer_id != Some(buffer.remote_id()) {
+                current_buffer_id = Some(buffer.remote_id());
+                current_file_row = rows.len();
+                let path = buffer.file().map(|file| file.path().clone());
+                rows.push(SearchResultRow::File {
+                    name: path
+                        .as_ref()
+                        .and_then(|path| path.file_name())
+                        .unwrap_or("untitled")
+                        .to_string()
+                        .into(),
+                    directory: path
+                        .as_ref()
+                        .and_then(|path| path.parent())
+                        .map(|parent| parent.as_unix_str().to_string())
+                        .unwrap_or_default()
+                        .into(),
+                    icon: path.as_ref().and_then(|path| {
+                        FileIcons::get_icon(std::path::Path::new(path.as_unix_str()), cx)
+                    }),
+                    match_index,
+                    match_count: 0,
+                });
+            }
+            if let Some(SearchResultRow::File { match_count, .. }) = rows.get_mut(current_file_row)
+            {
+                *match_count += 1;
+            }
+
+            let line_end_column = snapshot.line_len(MultiBufferRow(start.row));
+            let line: String = snapshot
+                .text_for_range(
+                    text::Point::new(start.row, 0)..text::Point::new(start.row, line_end_column),
+                )
+                .collect();
+            let match_start = start.column as usize;
+            let match_end = if end.row == start.row {
+                end.column
+            } else {
+                line_end_column
+            } as usize;
+            let indentation = line.len() - line.trim_start().len();
+            let mut text_start =
+                indentation.max(match_start.saturating_sub(RESULT_ROW_LEADING_CONTEXT));
+            while !line.is_char_boundary(text_start) {
+                text_start -= 1;
+            }
+            let text = &line[text_start..];
+            let highlight_indices = text
+                .char_indices()
+                .map(|(index, _)| index)
+                .filter(|index| (match_start..match_end).contains(&(index + text_start)))
+                .collect();
+            rows.push(SearchResultRow::Match {
+                match_index,
+                text: text.to_string().into(),
+                highlight_indices,
+            });
+        }
+
+        let rows: Arc<[SearchResultRow]> = rows.into();
+        self.result_rows = (key, rows.clone());
+        rows
+    }
+
+    fn render_result_rows(
+        &mut self,
+        range: Range<usize>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let rows = self.result_rows(cx);
+        let active_match_index = self.active_match_index;
+        rows.get(range.clone())
+            .unwrap_or_default()
+            .iter()
+            .zip(range)
+            .map(|(row, row_index)| match row {
+                SearchResultRow::File {
+                    name,
+                    directory,
+                    icon,
+                    match_index,
+                    match_count,
+                } => {
+                    let match_index = *match_index;
+                    ListItem::new(("project-search-result-row", row_index))
+                        .start_slot::<Icon>(
+                            icon.clone()
+                                .map(|icon| Icon::from_path(icon).color(Color::Muted)),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .min_w_0()
+                                .child(Label::new(name.clone()))
+                                .child(
+                                    Label::new(directory.clone())
+                                        .color(Color::Muted)
+                                        .size(LabelSize::Small)
+                                        .truncate(),
+                                ),
+                        )
+                        .end_slot(
+                            Label::new(match_count.to_string())
+                                .color(Color::Muted)
+                                .size(LabelSize::Small),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.activate_match(match_index, window, cx);
+                        }))
+                        .into_any_element()
+                }
+                SearchResultRow::Match {
+                    match_index,
+                    text,
+                    highlight_indices,
+                } => {
+                    let match_index = *match_index;
+                    ListItem::new(("project-search-result-row", row_index))
+                        .indent_level(1)
+                        .toggle_state(active_match_index == Some(match_index))
+                        .child(
+                            HighlightedLabel::new(text.clone(), highlight_indices.clone())
+                                .size(LabelSize::Small)
+                                .truncate(),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.activate_match(match_index, window, cx);
+                        }))
+                        .into_any_element()
+                }
+            })
+            .collect()
     }
 
     fn focus_query_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
