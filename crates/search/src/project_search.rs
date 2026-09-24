@@ -2607,14 +2607,14 @@ impl ProjectSearchView {
                                 .child(
                                     Label::new(directory.clone())
                                         .color(Color::Muted)
-                                        .size(LabelSize::Small)
+                                        .size(LabelSize::Default)
                                         .truncate(),
                                 ),
                         )
                         .end_slot(
                             Label::new(match_count.to_string())
                                 .color(Color::Muted)
-                                .size(LabelSize::Small),
+                                .size(LabelSize::Default),
                         )
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.activate_match(match_index, window, cx);
@@ -2633,7 +2633,7 @@ impl ProjectSearchView {
                         .child(
                             h_flex().h(RESULT_ROW_HEIGHT).min_w_0().child(
                                 HighlightedLabel::new(text.clone(), highlight_indices.clone())
-                                    .size(LabelSize::Small)
+                                    .size(LabelSize::Default)
                                     .truncate(),
                             ),
                         )
