@@ -52,8 +52,8 @@ use std::{
 };
 use text::OffsetRangeExt;
 use ui::{
-    CommonAnimationExt, HighlightedLabel, IconButtonShape, KeyBinding, ListItem, ListItemSpacing,
-    Toggleable, Tooltip, WithScrollbar, prelude::*, utils::SearchInputWidth,
+    CommonAnimationExt, HighlightedLabel, IconButtonShape, KeyBinding, ListItem, Toggleable,
+    Tooltip, WithScrollbar, prelude::*, utils::SearchInputWidth,
 };
 use util::{ResultExt as _, paths::PathMatcher};
 use workspace::{
@@ -378,6 +378,8 @@ enum SearchResultRow {
 /// Characters of a line kept before its match, so long lines still show the match.
 const RESULT_ROW_LEADING_CONTEXT: usize = 40;
 const RESULT_ROWS_MIN_WIDTH: Pixels = px(150.);
+/// Fixed so file and match rows line up in the uniform list despite different label sizes.
+const RESULT_ROW_HEIGHT: Rems = rems(1.5);
 const FILE_PREVIEW_MIN_WIDTH: Pixels = px(200.);
 
 struct DraggedResultRowsDivider;
@@ -1224,6 +1226,8 @@ impl Item for ProjectSearchView {
     fn deactivated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.results_editor
             .update(cx, |editor, cx| editor.deactivated(window, cx));
+        self.file_preview_editor
+            .update(cx, |editor, cx| editor.deactivated(window, cx));
     }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
@@ -1332,6 +1336,9 @@ impl Item for ProjectSearchView {
         cx: &mut Context<Self>,
     ) {
         self.results_editor.update(cx, |editor, cx| {
+            editor.added_to_workspace(workspace, window, cx)
+        });
+        self.file_preview_editor.update(cx, |editor, cx| {
             editor.added_to_workspace(workspace, window, cx)
         });
     }
@@ -2587,13 +2594,13 @@ impl ProjectSearchView {
                 } => {
                     let match_index = *match_index;
                     ListItem::new(("project-search-result-row", row_index))
-                        .spacing(ListItemSpacing::Sparse)
                         .start_slot::<Icon>(
                             icon.clone()
                                 .map(|icon| Icon::from_path(icon).color(Color::Muted)),
                         )
                         .child(
                             h_flex()
+                                .h(RESULT_ROW_HEIGHT)
                                 .gap_1()
                                 .min_w_0()
                                 .child(Label::new(name.clone()))
@@ -2621,13 +2628,14 @@ impl ProjectSearchView {
                 } => {
                     let match_index = *match_index;
                     ListItem::new(("project-search-result-row", row_index))
-                        .spacing(ListItemSpacing::Sparse)
                         .indent_level(1)
                         .toggle_state(active_match_index == Some(match_index))
                         .child(
-                            HighlightedLabel::new(text.clone(), highlight_indices.clone())
-                                .size(LabelSize::Small)
-                                .truncate(),
+                            h_flex().h(RESULT_ROW_HEIGHT).min_w_0().child(
+                                HighlightedLabel::new(text.clone(), highlight_indices.clone())
+                                    .size(LabelSize::Small)
+                                    .truncate(),
+                            ),
                         )
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.activate_match(match_index, window, cx);
