@@ -6992,6 +6992,20 @@ impl GitPanel {
                     *hovered && !this.has_staged_changes() && !this.has_unstaged_conflicts();
                 cx.notify()
             }))
+            .gap_1()
+            .when(no_verify, |this| {
+                this.child(
+                    IconButton::new("skip-hooks-indicator", IconName::Warning)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Warning)
+                        .tooltip(Tooltip::text(
+                            "Skip Hooks is on (git commit --no-verify). Click to turn off.",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_skip_hooks_enabled(false, cx);
+                        })),
+                )
+            })
             .child(SplitButton::new(
                 ButtonLike::new_rounded_left(format!("split-button-left-{}", title))
                     .layer(ElevationIndex::ModalSurface)
