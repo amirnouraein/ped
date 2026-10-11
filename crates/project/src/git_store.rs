@@ -7165,6 +7165,21 @@ impl Repository {
         )
     }
 
+    pub fn revert_commit(&mut self, commit: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job("revert", None, move |git_repo, _| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState {
+                    backend,
+                    environment,
+                    ..
+                }) => backend.revert_commit(commit, environment).await,
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("reverting commits is not supported in remote projects")
+                }
+            }
+        })
+    }
+
     pub fn reset(
         &mut self,
         commit: String,
