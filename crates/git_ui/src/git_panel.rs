@@ -3944,7 +3944,6 @@ impl GitPanel {
 
                 match result {
                     Ok(()) => {
-                        this.set_skip_hooks_enabled(false, cx);
                         if options.amend {
                             this.set_amend_pending(false, cx);
                         } else {
@@ -10364,7 +10363,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_skip_hooks_clears_after_successful_commit(cx: &mut TestAppContext) {
+    async fn test_skip_hooks_remains_enabled_after_successful_commit(cx: &mut TestAppContext) {
         init_test(cx);
         let (fs, _, _, panel, mut cx) = setup_git_panel_with_changes(
             cx,
@@ -10390,7 +10389,7 @@ mod tests {
         cx.run_until_parked();
 
         panel.read_with(&cx, |panel, _| {
-            assert!(!panel.skip_hooks_enabled());
+            assert!(panel.skip_hooks_enabled());
         });
         let commit_count = fs
             .with_git_state(path!("/project/.git").as_ref(), false, |state| {
