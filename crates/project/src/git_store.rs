@@ -118,6 +118,7 @@ pub struct GitStore {
     buffer_ids_by_index_text_buffer_id: HashMap<BufferId, BufferId>,
     shared_diffs: HashMap<proto::PeerId, HashMap<BufferId, SharedDiffs>>,
     object_read_limiter: Arc<Semaphore>,
+    _auto_fetch_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1028,6 +1029,9 @@ impl GitStore {
             },
         ));
 
+        let auto_fetch_task = matches!(state, GitStoreState::Local { .. })
+            .then(|| cx.spawn(async move |this, cx| Self::auto_fetch_loop(this, cx).await));
+
         let diff_base_setting = ProjectSettings::get_global(cx).git.diff_base;
         GitStore {
             state,
@@ -1040,12 +1044,49 @@ impl GitStore {
             display_diffs: HashMap::default(),
             worktree_ids: HashMap::default(),
             active_repo_id: None,
+            _auto_fetch_task: auto_fetch_task,
             _subscriptions,
             loading_diffs: HashMap::default(),
             shared_diffs: HashMap::default(),
             object_read_limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_OBJECT_READS)),
             diffs: HashMap::default(),
             buffer_ids_by_index_text_buffer_id: HashMap::default(),
+        }
+    }
+
+    // Ticks every minute rather than sleeping for the full interval so that
+    // changes to the setting take effect without restarting.
+    async fn auto_fetch_loop(this: WeakEntity<Self>, cx: &mut AsyncApp) {
+        let mut minutes_since_fetch = 0;
+        loop {
+            cx.background_executor()
+                .timer(Duration::from_secs(60))
+                .await;
+            minutes_since_fetch += 1;
+            let interval = cx.update(|cx| {
+                ProjectSettings::get_global(cx)
+                    .git
+                    .auto_fetch_interval_minutes
+            });
+            if interval == 0 || minutes_since_fetch < interval {
+                continue;
+            }
+            minutes_since_fetch = 0;
+            let Ok(repositories) = this.read_with(cx, |this, _| {
+                this.repositories.values().cloned().collect::<Vec<_>>()
+            }) else {
+                return;
+            };
+            for repository in repositories {
+                // Background fetches must never prompt, so credential requests are dropped and the fetch fails.
+                let askpass = AskPassDelegate::new(cx, |_, _, _| {});
+                let fetch = repository.update(cx, |repository, cx| {
+                    repository.fetch(FetchOptions::All, askpass, cx)
+                });
+                if let Ok(Err(error)) = fetch.await {
+                    log::warn!("background git fetch failed: {error:#}");
+                }
+            }
         }
     }
 

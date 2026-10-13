@@ -694,6 +694,11 @@ pub struct GitSettings {
     ///
     /// Default: ../worktrees
     pub worktree_directory: Option<String>,
+    /// How often, in minutes, to run `git fetch --all` in the background.
+    /// Set to 0 to disable.
+    ///
+    /// Default: 0
+    pub auto_fetch_interval_minutes: Option<u64>,
 }
 
 #[with_fallible_options]

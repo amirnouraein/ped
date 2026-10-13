@@ -1895,6 +1895,9 @@
     //
     // Trailing slashes are ignored.
     "worktree_directory": "../worktrees",
+    // How often, in minutes, to run `git fetch --all` in the background.
+    // Set to 0 to disable.
+    "auto_fetch_interval_minutes": 0,
   },
   // The list of custom Git hosting providers.
   "git_hosting_providers": [

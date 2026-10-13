@@ -503,6 +503,10 @@ pub struct GitSettings {
     ///
     /// Default: ../worktrees
     pub worktree_directory: String,
+    /// How often, in minutes, to run `git fetch --all` in the background.
+    ///
+    /// Default: 0 (disabled)
+    pub auto_fetch_interval_minutes: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -719,6 +723,7 @@ impl Settings for ProjectSettings {
                 .worktree_directory
                 .clone()
                 .unwrap_or_else(|| DEFAULT_WORKTREE_DIRECTORY.to_string()),
+            auto_fetch_interval_minutes: git.auto_fetch_interval_minutes.unwrap_or_default(),
         };
         Self {
             context_servers: project
