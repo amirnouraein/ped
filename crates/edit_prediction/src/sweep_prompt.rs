@@ -1,4 +1,5 @@
 use anyhow::{Context as _, Result, anyhow};
+use cloud_llm_client::PredictEditsRequestTrigger;
 use gpui::{App, AppContext as _, Task};
 use language::{
     BufferSnapshot, OffsetRangeExt as _, Point, ToOffset as _, ToPoint as _,
@@ -15,8 +16,7 @@ use crate::{
     zeta,
 };
 
-const WINDOW_LINES_ABOVE: u32 = 10;
-const WINDOW_LINES_BELOW: u32 = 10;
+const HIGH_EFFORT: &str = "high";
 const MAX_RECENT_CHANGE_BLOCKS: usize = 3;
 const MAX_RECENT_CHANGE_LINES: usize = 40;
 const RESERVED_SWEEP_TOKENS: [&str; 2] = ["<|file_sep|>", "</s>"];
@@ -77,13 +77,17 @@ pub fn request_prediction(
         ..
     } = input;
 
+    let is_high_effort = matches!(trigger, PredictEditsRequestTrigger::ExplicitHighEffort);
+    let effort = is_high_effort.then(|| HIGH_EFFORT.to_string());
+    let window_lines = if is_high_effort {
+        custom_settings.high_effort_sweep_window_lines
+    } else {
+        custom_settings.sweep_window_lines
+    };
+
     let cursor_point = position.to_point(&snapshot);
-    let window_range = fixed_line_window_around_cursor(
-        &snapshot,
-        cursor_point,
-        WINDOW_LINES_ABOVE,
-        WINDOW_LINES_BELOW,
-    );
+    let window_range =
+        fixed_line_window_around_cursor(&snapshot, cursor_point, window_lines, window_lines);
     let file_path = prompt_file_path(&snapshot);
     let filtered_related_files = filter_redundant_excerpts(
         related_files,
@@ -143,6 +147,7 @@ pub fn request_prediction(
             prompt,
             custom_settings.max_output_tokens,
             RESERVED_SWEEP_TOKENS.map(str::to_string).to_vec(),
+            effort,
             api_key,
             &http_client,
         )

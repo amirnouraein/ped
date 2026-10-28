@@ -1150,6 +1150,11 @@
     // Choices: project_diff, file_diff, view_file
     // Default: project_diff
     "entry_primary_click_action": "project_diff",
+    // Whether to show a confirmation prompt before discarding changes to a file
+    // from the git panel.
+    //
+    // Default: true
+    "confirm_discard": true,
     // Whether the commit message editor is shown in the git panel by default.
     //
     // Choices: expanded, collapsed
@@ -1969,6 +1974,8 @@
       "model": "qwen2.5-coder:7b-base",
       "prompt_format": "infer",
       "max_output_tokens": 64,
+      "sweep_window_lines": 10,
+      "high_effort_sweep_window_lines": 20,
       "prediction_debounce": 0,
     },
     "open_ai_compatible_api": {
@@ -1976,6 +1983,8 @@
       "model": "",
       "prompt_format": "infer",
       "max_output_tokens": 64,
+      "sweep_window_lines": 10,
+      "high_effort_sweep_window_lines": 20,
       "prediction_debounce": 0,
     },
     "zed": {

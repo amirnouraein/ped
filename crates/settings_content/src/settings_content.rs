@@ -814,6 +814,12 @@ pub struct GitPanelSettingsContent {
     /// Default: project_diff
     pub entry_primary_click_action: Option<GitPanelClickBehavior>,
 
+    /// Whether to show a confirmation prompt before discarding changes to a file
+    /// from the Git panel.
+    ///
+    /// Default: true
+    pub confirm_discard: Option<bool>,
+
     /// Whether the commit message editor is shown in the Git panel by default.
     ///
     /// Default: expanded

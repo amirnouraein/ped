@@ -576,6 +576,32 @@ pub trait LanguageModelProvider: LanguageModelClient {
     /// Copy shown the first time a user enables fast mode for a model from
     /// this provider. Returning `None` skips the confirmation prompt and lets
     /// the toggle apply silently.
+    /// Whether the user can choose which upstream endpoint serves `model`.
+    fn supports_route_selection(&self, _model: &LanguageModel) -> bool {
+        false
+    }
+
+    /// The endpoints known for `model`. Empty until `refresh_routes` has loaded them.
+    fn available_routes(&self, _model: &LanguageModel, _cx: &App) -> Vec<LanguageModelRoute> {
+        Vec::new()
+    }
+
+    /// Starts loading the routes for `model` if they are not already loaded.
+    fn refresh_routes(&self, _model: &LanguageModel, _cx: &mut App) {}
+
+    /// The id of the route the user selected, or `None` for the gateway's default routing.
+    fn selected_route(&self, _model: &LanguageModel, _cx: &App) -> Option<SharedString> {
+        None
+    }
+
+    fn set_selected_route(
+        &self,
+        _model: &LanguageModel,
+        _route: Option<SharedString>,
+        _cx: &mut App,
+    ) {
+    }
+
     fn fast_mode_confirmation(&self, _cx: &App) -> Option<FastModeConfirmation> {
         None
     }

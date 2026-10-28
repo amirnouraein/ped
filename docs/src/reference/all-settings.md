@@ -6120,7 +6120,8 @@ See the [debugger page](../debugger.md) for more information about debugging sup
     "show_count_badge": false,
     "diff_stats": true,
     "commit_title_max_length": 0,
-    "entry_primary_click_action": "project_diff"
+    "entry_primary_click_action": "project_diff",
+    "confirm_discard": true
   }
 }
 ```
@@ -6145,6 +6146,7 @@ See the [debugger page](../debugger.md) for more information about debugging sup
 - `diff_stats`: Whether to show the addition/deletion change count next to each file in the git panel
 - `commit_title_max_length`: Maximum length of the commit message title before a warning is shown. Set to `0` to disable
 - `entry_primary_click_action`: Default action when clicking a changed file in the git panel. Can be `project_diff`, `file_diff`, or `view_file`
+- `confirm_discard`: Whether to show a confirmation prompt before discarding changes to a file from the git panel
 
 ## Git Worktree Directory
 

@@ -2778,7 +2778,8 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         let entries = self.effective_status_entries();
-        self.revert_entries(entries, action.skip_prompt, window, cx);
+        let skip_prompt = action.skip_prompt || !GitPanelSettings::get_global(cx).confirm_discard;
+        self.revert_entries(entries, skip_prompt, window, cx);
     }
 
     /// Returns the repo path and whether it represents a directory for the
@@ -3122,7 +3123,8 @@ impl GitPanel {
         match entries.len() {
             0 => return,
             1 => {
-                return self.revert_entries(entries, false, window, cx);
+                let skip_prompt = !GitPanelSettings::get_global(cx).confirm_discard;
+                return self.revert_entries(entries, skip_prompt, window, cx);
             }
             _ => {}
         }
@@ -3173,7 +3175,8 @@ impl GitPanel {
         match to_delete.len() {
             0 => return,
             1 => {
-                return self.revert_entries(to_delete, false, window, cx);
+                let skip_prompt = !GitPanelSettings::get_global(cx).confirm_discard;
+                return self.revert_entries(to_delete, skip_prompt, window, cx);
             }
             _ => {}
         };
@@ -6991,6 +6994,20 @@ impl GitPanel {
                     *hovered && !this.has_staged_changes() && !this.has_unstaged_conflicts();
                 cx.notify()
             }))
+            .gap_1()
+            .when(no_verify, |this| {
+                this.child(
+                    IconButton::new("skip-hooks-indicator", IconName::Warning)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Warning)
+                        .tooltip(Tooltip::text(
+                            "Skip Hooks is on (git commit --no-verify). Click to turn off.",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_skip_hooks_enabled(false, cx);
+                        })),
+                )
+            })
             .child(SplitButton::new(
                 ButtonLike::new_rounded_left(format!("split-button-left-{}", title))
                     .layer(ElevationIndex::ModalSurface)
@@ -8626,6 +8643,15 @@ impl GitPanel {
             ElementId::Name(format!("entry_{}_{}_checkbox_wrapper", display_name, ix).into());
         let checkbox_id: ElementId =
             ElementId::Name(format!("entry_{}_{}_checkbox", display_name, ix).into());
+        let discard_button_id: ElementId =
+            ElementId::Name(format!("entry_{}_{}_discard", display_name, ix).into());
+        let discard_tooltip: SharedString = if is_deleted {
+            "Restore File".into()
+        } else if is_created {
+            "Trash File".into()
+        } else {
+            "Discard Changes".into()
+        };
 
         let stage_status = GitPanel::stage_status_for_entry(entry, &repo);
         let stage_intent = self.stage_intent_for_entry_index(ix);
@@ -8749,6 +8775,32 @@ impl GitPanel {
                         stat.deleted as usize,
                     ))
                 })
+            })
+            .when(has_write_access, |el| {
+                el.child(
+                    IconButton::new(discard_button_id, IconName::Undo)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text(discard_tooltip))
+                        .on_click({
+                            let entry = entry.clone();
+                            let this = cx.weak_entity();
+                            move |_, window, cx| {
+                                this.update(cx, |this, cx| {
+                                    let skip_prompt =
+                                        !GitPanelSettings::get_global(cx).confirm_discard;
+                                    this.revert_entries(
+                                        vec![entry.clone()],
+                                        skip_prompt,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                                cx.stop_propagation();
+                            }
+                        }),
+                )
             })
             .child(
                 div()
