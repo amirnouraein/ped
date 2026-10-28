@@ -1326,6 +1326,7 @@ impl GitPanel {
         let pending_commit_message_restores = serialized_panel
             .map(|panel| panel.commit_messages)
             .unwrap_or_default();
+        let workspace_entity = cx.entity();
 
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
@@ -1428,6 +1429,23 @@ impl GitPanel {
                 }
                 _ => {}
             })
+            .detach();
+
+            cx.subscribe_in(
+                &workspace_entity,
+                window,
+                |this, workspace, event, window, cx| {
+                    if let workspace::Event::ActiveItemChanged = event
+                        && let Some(project_path) = workspace
+                            .read(cx)
+                            .active_item(cx)
+                            .and_then(|item| item.project_path(cx))
+                    {
+                        this.select_entry_by_path(project_path, window, cx);
+                        cx.notify();
+                    }
+                },
+            )
             .detach();
 
             cx.subscribe_in(
