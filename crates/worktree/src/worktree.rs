@@ -140,6 +140,7 @@ impl fmt::Debug for LoadedBinaryFile {
 
 pub struct LocalWorktree {
     snapshot: LocalSnapshot,
+    latest_snapshot: Arc<Mutex<Snapshot>>,
     scan_requests_tx: async_channel::Sender<ScanRequest>,
     path_prefixes_to_scan_tx: async_channel::Sender<PathPrefixScanRequest>,
     is_scanning: (watch::Sender<bool>, watch::Receiver<bool>),
@@ -598,6 +599,7 @@ impl Worktree {
             let mut worktree = LocalWorktree {
                 share_private_files,
                 next_entry_id,
+                latest_snapshot: Arc::new(Mutex::new(snapshot.snapshot.clone())),
                 snapshot,
                 is_scanning: watch::channel_with(true),
                 snapshot_subscriptions: Default::default(),
@@ -817,6 +819,16 @@ impl Worktree {
         SettingsLocation {
             worktree_id: self.id(),
             path: RelPath::empty(),
+        }
+    }
+
+    /// Returns a handle that always holds the worktree's latest snapshot. Long-lived
+    /// holders should prefer this to `snapshot()`, because a retained snapshot keeps its
+    /// entire tree alive once a rescan has rewritten the worktree's own copy.
+    pub fn latest_snapshot(&self) -> Arc<Mutex<Snapshot>> {
+        match self {
+            Worktree::Local(worktree) => worktree.latest_snapshot.clone(),
+            Worktree::Remote(worktree) => Arc::new(Mutex::new(worktree.snapshot.clone())),
         }
     }
 
@@ -1473,6 +1485,7 @@ impl LocalWorktree {
         let old_root_repo_common_dir =
             root_repo_metadata_changed.then(|| self.snapshot.root_repo_common_dir.clone());
         self.snapshot = new_snapshot;
+        *self.latest_snapshot.lock() = self.snapshot.snapshot.clone();
 
         if let Some(share) = self.update_observer.as_mut() {
             share

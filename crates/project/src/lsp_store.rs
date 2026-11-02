@@ -17001,7 +17001,9 @@ pub fn language_server_settings_for<'a>(
 
 pub struct LocalLspAdapterDelegate {
     lsp_store: WeakEntity<LspStore>,
-    worktree: worktree::Snapshot,
+    worktree_id: WorktreeId,
+    worktree_root_path: Arc<Path>,
+    latest_worktree_snapshot: Arc<Mutex<worktree::Snapshot>>,
     fs: Arc<dyn Fs>,
     http_client: Arc<dyn HttpClient>,
     background_executor: BackgroundExecutor,
@@ -17022,9 +17024,12 @@ impl LocalLspAdapterDelegate {
         let load_shell_env_task =
             environment.update(cx, |env, cx| env.worktree_environment(worktree.clone(), cx));
 
+        let worktree = worktree.read(cx);
         Arc::new(Self {
             lsp_store,
-            worktree: worktree.read(cx).snapshot(),
+            worktree_id: worktree.id(),
+            worktree_root_path: worktree.abs_path(),
+            latest_worktree_snapshot: worktree.latest_snapshot(),
             fs,
             http_client,
             background_executor: cx.background_executor().clone(),
@@ -17069,15 +17074,17 @@ impl LspAdapterDelegate for LocalLspAdapterDelegate {
     }
 
     fn worktree_id(&self) -> WorktreeId {
-        self.worktree.id()
+        self.worktree_id
     }
 
     fn worktree_root_path(&self) -> &Path {
-        self.worktree.abs_path().as_ref()
+        &self.worktree_root_path
     }
 
     fn resolve_relative_path(&self, path: PathBuf) -> PathBuf {
-        self.worktree.resolve_relative_path(path)
+        self.latest_worktree_snapshot
+            .lock()
+            .resolve_relative_path(path)
     }
 
     async fn shell_env(&self) -> HashMap<String, String> {
@@ -17193,11 +17200,13 @@ impl LspAdapterDelegate for LocalLspAdapterDelegate {
     }
 
     async fn read_text_file(&self, path: &RelPath) -> Result<String> {
-        let entry = self
-            .worktree
-            .entry_for_path(path)
-            .with_context(|| format!("no worktree entry for path {path:?}"))?;
-        let abs_path = self.worktree.absolutize(&entry.path);
+        let abs_path = {
+            let snapshot = self.latest_worktree_snapshot.lock();
+            let entry = snapshot
+                .entry_for_path(path)
+                .with_context(|| format!("no worktree entry for path {path:?}"))?;
+            snapshot.absolutize(&entry.path)
+        };
         self.fs.load(&abs_path).await
     }
 }

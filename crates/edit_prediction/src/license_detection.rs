@@ -323,13 +323,13 @@ impl LicenseDetectionWatcher {
                 | worktree::Event::Deleted => {}
             });
 
-        let worktree_snapshot = worktree.read(cx).snapshot();
+        let latest_worktree_snapshot = worktree.read(cx).latest_snapshot();
         let (mut is_open_source_tx, is_open_source_rx) = watch::channel_with::<bool>(false);
 
         let _is_open_source_task = cx.background_spawn(async move {
             let mut eligible_licenses = BTreeSet::new();
             while let Some(rel_path) = files_to_check_rx.next().await {
-                let abs_path = worktree_snapshot.absolutize(&rel_path);
+                let abs_path = latest_worktree_snapshot.lock().absolutize(&rel_path);
                 let was_open_source = !eligible_licenses.is_empty();
                 if Self::is_path_eligible(&fs, abs_path).await.unwrap_or(false) {
                     eligible_licenses.insert(rel_path);
