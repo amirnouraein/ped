@@ -1949,7 +1949,12 @@ impl ProjectSearchView {
                 return Some(QuerySeed::Query(buffer_search_query));
             }
 
-            let editor = item.act_as::<Editor>(cx)?;
+            // `act_as` resolves a project search to its hidden `results_editor`, but the
+            // user selects text in the visible file preview.
+            let editor = match item.downcast::<ProjectSearchView>() {
+                Some(search_view) => search_view.read(cx).file_preview_editor.clone(),
+                None => item.act_as::<Editor>(cx)?,
+            };
             let query = editor.query_suggestion(None, window, cx);
             if query.is_empty() {
                 None
@@ -3945,6 +3950,7 @@ pub mod tests {
     use editor::{DisplayPoint, ToPoint, display_map::DisplayRow};
     use gpui::{Action, TestAppContext, VisualTestContext, WindowHandle};
     use language::{FakeLspAdapter, Point as BufferPoint, rust_lang};
+    use multi_buffer::MultiBufferOffset;
     use pretty_assertions::assert_eq;
     use project::{FakeFs, Fs};
     use serde_json::json;
@@ -6482,6 +6488,68 @@ pub mod tests {
 
         project_search_view.update(&mut cx, |search_view, cx| {
             assert_eq!(search_view.entity.read(cx).match_ranges.len(), 2);
+        });
+    }
+
+    #[perf]
+    #[gpui::test]
+    async fn test_redeploy_search_seeds_query_from_file_preview_selection(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "one.rs": "alpha beta\ngamma beta\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("window should contain a workspace");
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            ProjectSearchView::deploy_search(workspace, &DeploySearch::default(), window, cx)
+        });
+        let project_search_view = workspace
+            .read_with(&cx, |workspace, cx| {
+                workspace
+                    .active_pane()
+                    .read(cx)
+                    .active_item()
+                    .and_then(|item| item.downcast::<ProjectSearchView>())
+            })
+            .expect("should open a project search view");
+        project_search_view.update_in(&mut cx, |search_view, window, cx| {
+            search_view.set_query("beta", window, cx);
+            search_view.search(SearchMode::Manual, cx);
+        });
+        cx.run_until_parked();
+
+        project_search_view.update_in(&mut cx, |search_view, window, cx| {
+            search_view.sync_file_preview(window, cx);
+            search_view.file_preview_editor.update(cx, |editor, cx| {
+                let text = editor.text(cx);
+                let start = text
+                    .find("gamma")
+                    .expect("preview should show the matched file");
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges([
+                        MultiBufferOffset(start)..MultiBufferOffset(start + "gamma".len())
+                    ])
+                });
+            });
+        });
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            ProjectSearchView::deploy_search(workspace, &DeploySearch::default(), window, cx)
+        });
+        project_search_view.update(&mut cx, |search_view, cx| {
+            assert_eq!(search_view.search_query_text(cx), "gamma");
         });
     }
 
