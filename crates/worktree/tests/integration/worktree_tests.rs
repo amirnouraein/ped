@@ -7814,3 +7814,50 @@ fn set_file_scan_depth(cx: &mut TestAppContext, depth: Option<u32>) {
         });
     });
 }
+
+#[gpui::test]
+async fn test_latest_snapshot_follows_worktree_updates(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree("/root", json!({ "a": "" })).await;
+
+    let tree = Worktree::local(
+        Path::new("/root"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    let latest_snapshot = tree.read_with(cx, |tree, _| tree.latest_snapshot());
+    let frozen_snapshot = tree.read_with(cx, |tree, _| tree.snapshot());
+    assert!(
+        latest_snapshot
+            .lock()
+            .entry_for_path(rel_path("a"))
+            .is_some()
+    );
+    assert!(
+        latest_snapshot
+            .lock()
+            .entry_for_path(rel_path("b"))
+            .is_none()
+    );
+
+    fs.insert_file("/root/b", Vec::new()).await;
+    tree.flush_fs_events(cx).await;
+
+    assert!(
+        latest_snapshot
+            .lock()
+            .entry_for_path(rel_path("b"))
+            .is_some()
+    );
+    assert!(frozen_snapshot.entry_for_path(rel_path("b")).is_none());
+}

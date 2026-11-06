@@ -513,6 +513,10 @@ struct CurrentEditPrediction {
     pub was_shown: bool,
     pub shown_with: Option<edit_prediction_types::SuggestionDisplayType>,
     pub e2e_latency: std::time::Duration,
+    /// Set once part of this prediction has been accepted while other edits remain.
+    /// Acceptance is reported to the provider only when the prediction is finally
+    /// consumed, so a prediction is never reported as both accepted and rejected.
+    pub was_partially_accepted: bool,
 }
 
 impl CurrentEditPrediction {
@@ -934,6 +938,9 @@ fn predict_edits_request_trigger_from_editor_trigger(
             PredictEditsRequestTrigger::DiagnosticNavigation
         }
         EditPredictionRequestTrigger::Explicit => PredictEditsRequestTrigger::Explicit,
+        EditPredictionRequestTrigger::ExplicitHighEffort => {
+            PredictEditsRequestTrigger::ExplicitHighEffort
+        }
         EditPredictionRequestTrigger::BufferEdit => PredictEditsRequestTrigger::BufferEdit,
         EditPredictionRequestTrigger::LSPCompletionAccepted => {
             PredictEditsRequestTrigger::LSPCompletionAccepted
@@ -1854,11 +1861,41 @@ impl EditPredictionStore {
     }
 
     fn accept_current_prediction(&mut self, project: &Entity<Project>, cx: &mut Context<Self>) {
-        let Some(current_prediction) = self
-            .projects
-            .get_mut(&project.entity_id())
-            .and_then(|project_state| project_state.current_prediction.take())
-        else {
+        let Some(project_state) = self.projects.get_mut(&project.entity_id()) else {
+            return;
+        };
+
+        // The editor only applies the group of edits closest to the cursor. By the time
+        // this runs that group is already in the buffer, so interpolating tells us whether
+        // other edits from the same prediction are still waiting to be accepted.
+        let has_remaining_edits =
+            project_state
+                .current_prediction
+                .as_ref()
+                .is_some_and(|current_prediction| {
+                    let prediction = &current_prediction.prediction;
+                    prediction
+                        .interpolate(&prediction.buffer.read(cx))
+                        .is_some_and(|edits| !edits.is_empty())
+                });
+        if has_remaining_edits {
+            let buffer = project_state
+                .current_prediction
+                .as_mut()
+                .map(|current_prediction| {
+                    current_prediction.was_partially_accepted = true;
+                    current_prediction.prediction.buffer.clone()
+                });
+            for pending_prediction in mem::take(&mut project_state.pending_predictions) {
+                project_state.cancel_pending_prediction(pending_prediction, cx);
+            }
+            if let Some(buffer) = buffer {
+                self.report_changes_for_buffer(&buffer, project, true, true, cx);
+            }
+            return;
+        }
+
+        let Some(current_prediction) = project_state.current_prediction.take() else {
             return;
         };
 
@@ -1879,6 +1916,10 @@ impl EditPredictionStore {
             project_state.cancel_pending_prediction(pending_prediction, cx);
         }
 
+        self.report_prediction_accepted(current_prediction, cx);
+    }
+
+    fn report_prediction_accepted(&self, current_prediction: CurrentEditPrediction, cx: &App) {
         match self.edit_prediction_model {
             EditPredictionModel::Mercury => {
                 mercury::edit_prediction_accepted(
@@ -2221,6 +2262,10 @@ impl EditPredictionStore {
         if let Some(project_state) = self.projects.get_mut(&project.entity_id()) {
             project_state.pending_predictions.clear();
             if let Some(prediction) = project_state.current_prediction.take() {
+                if prediction.was_partially_accepted {
+                    self.report_prediction_accepted(prediction, cx);
+                    return;
+                }
                 let model_version = prediction.prediction.model_version.clone();
                 self.reject_prediction(
                     prediction.prediction.id,
@@ -2684,6 +2729,7 @@ impl EditPredictionStore {
                             was_shown: false,
                             shown_with: None,
                             e2e_latency,
+                            was_partially_accepted: false,
                         };
 
                         if let Some(current_prediction) = project_state.current_prediction.as_ref()
@@ -3155,9 +3201,19 @@ impl EditPredictionStore {
         cursor_position: language::Anchor,
         cx: &mut Context<Self>,
     ) {
+        let settings = &all_language_settings(None, cx).edit_predictions;
+        let sweep_window_lines = match settings.provider {
+            EditPredictionProvider::Ollama => settings.ollama.as_ref(),
+            EditPredictionProvider::OpenAiCompatibleApi => settings.open_ai_compatible_api.as_ref(),
+            _ => None,
+        }
+        .map(|custom_settings| custom_settings.sweep_window_lines);
         self.get_or_init_project(project, cx)
             .context
             .update(cx, |store, cx| {
+                if let Some(sweep_window_lines) = sweep_window_lines {
+                    store.set_usage_exclusion_line_count(sweep_window_lines);
+                }
                 store.refresh(buffer.clone(), cursor_position, cx);
             });
     }

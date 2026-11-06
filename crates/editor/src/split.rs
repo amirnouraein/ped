@@ -457,8 +457,24 @@ impl RenderOnce for DiffStyleControls {
             IconName::DiffSplit
         };
 
+        let ignore_whitespace = buffer_diff::IgnoreWhitespaceInDiffs::get(cx);
+
         h_flex()
             .gap_1()
+            .child(
+                IconButton::new("diff-ignore-whitespace", IconName::Space)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(ignore_whitespace)
+                    .tooltip(Tooltip::text(if ignore_whitespace {
+                        "Show Whitespace Changes"
+                    } else {
+                        "Ignore Whitespace Changes"
+                    }))
+                    .on_click(move |_, _, cx| {
+                        cx.set_global(buffer_diff::IgnoreWhitespaceInDiffs(!ignore_whitespace));
+                        cx.refresh_windows();
+                    }),
+            )
             .child(
                 IconButton::new("diff-style-unified", IconName::DiffUnified)
                     .icon_size(IconSize::Small)

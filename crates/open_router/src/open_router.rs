@@ -437,6 +437,37 @@ pub struct ModelEntry {
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+pub struct ModelEndpointsResponse {
+    pub data: ModelEndpointsData,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+pub struct ModelEndpointsData {
+    #[serde(default)]
+    pub endpoints: Vec<ModelEndpoint>,
+}
+
+/// One upstream provider serving a model through OpenRouter.
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+pub struct ModelEndpoint {
+    pub name: String,
+    pub provider_name: String,
+    /// Identifier accepted by `provider.order` in completion requests.
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub quantization: Option<String>,
+    #[serde(default)]
+    pub context_length: Option<u64>,
+    #[serde(default)]
+    pub max_completion_tokens: Option<u64>,
+    #[serde(default)]
+    pub status: Option<i64>,
+    #[serde(default)]
+    pub uptime_last_30m: Option<f64>,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
 pub struct ModelArchitecture {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_modalities: Vec<String>,
@@ -509,6 +540,61 @@ fn completion_headers(extra_headers: &CustomHeaders) -> CustomHeaders {
             .map(|(name, value)| (name.clone(), value.clone())),
     );
     CustomHeaders::new(headers)
+}
+
+pub async fn list_model_endpoints(
+    client: &dyn HttpClient,
+    api_url: &str,
+    api_key: &str,
+    model_id: &str,
+    extra_headers: &CustomHeaders,
+) -> Result<Vec<ModelEndpoint>, OpenRouterError> {
+    let uri = format!("{api_url}/models/{model_id}/endpoints");
+    let request = HttpRequest::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("HTTP-Referer", "https://zed.dev")
+        .header("X-Title", OPEN_ROUTER_APP_TITLE)
+        .extra_headers(extra_headers)
+        .body(AsyncBody::default())
+        .map_err(OpenRouterError::BuildRequestBody)?;
+    let host = request.uri().host().unwrap_or(api_url).to_owned();
+    let mut response = client
+        .send(request)
+        .await
+        .map_err(|error| OpenRouterError::HttpSend { host, error })?;
+
+    let mut body = String::new();
+    response
+        .body_mut()
+        .read_to_string(&mut body)
+        .await
+        .map_err(OpenRouterError::ReadResponse)?;
+
+    if response.status().is_success() {
+        let response: ModelEndpointsResponse =
+            serde_json::from_str(&body).map_err(OpenRouterError::DeserializeResponse)?;
+        Ok(response.data.endpoints)
+    } else {
+        let status = response.status();
+        let error_response = match serde_json::from_str::<OpenRouterErrorResponse>(&body) {
+            Ok(OpenRouterErrorResponse { error }) => error,
+            Err(_) => OpenRouterErrorBody {
+                code: status.as_u16(),
+                message: body,
+                metadata: None,
+            },
+        };
+
+        Err(OpenRouterError::ApiError(ApiError {
+            status: Some(status.as_u16()),
+            code: error_response.code,
+            message: error_response.message,
+            retry_after: retry_after_with_rate_limit_default(status, response.headers()),
+        }))
+    }
 }
 
 pub async fn list_models(

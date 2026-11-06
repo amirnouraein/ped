@@ -1,3 +1,4 @@
+use crate::outline_item_body_range;
 use language::{BufferSnapshot, OffsetRangeExt as _, Point};
 use std::ops::Range;
 
@@ -28,8 +29,7 @@ pub fn assemble_excerpt_ranges(
             }
 
             if item_range.end > input_range.start {
-                let body_range = outline_item
-                    .body_range(buffer)
+                let body_range = outline_item_body_range(outline_item, buffer)
                     .map(|body| clip_range_to_lines(&body, true, buffer))
                     .filter(|body_range| {
                         body_range.to_offset(buffer).len() > MAX_OUTLINE_ITEM_BODY_SIZE
@@ -57,8 +57,7 @@ pub fn assemble_excerpt_ranges(
 
                             add_outline_item(
                                 next_item_range,
-                                next_outline_item
-                                    .body_range(buffer)
+                                outline_item_body_range(next_outline_item, buffer)
                                     .map(|body| clip_range_to_lines(&body, true, buffer)),
                                 *input_order,
                                 buffer,

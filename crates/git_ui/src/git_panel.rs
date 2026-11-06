@@ -1619,6 +1619,23 @@ impl GitPanel {
             .detach();
 
             cx.subscribe_in(
+                &workspace_entity,
+                window,
+                |this, workspace, event, window, cx| {
+                    if let workspace::Event::ActiveItemChanged = event
+                        && let Some(project_path) = workspace
+                            .read(cx)
+                            .active_item(cx)
+                            .and_then(|item| item.project_path(cx))
+                    {
+                        this.select_entry_by_path(project_path, window, cx);
+                        cx.notify();
+                    }
+                },
+            )
+            .detach();
+
+            cx.subscribe_in(
                 &git_store,
                 window,
                 move |this, _git_store, event, window, cx| match event {
@@ -3085,7 +3102,8 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         let targets = self.discard_targets();
-        self.revert_entries(targets, action.skip_prompt, window, cx);
+        let skip_prompt = action.skip_prompt || !GitPanelSettings::get_global(cx).confirm_discard;
+        self.revert_entries(targets, skip_prompt, window, cx);
     }
 
     /// The files a discard acts on, mirroring `effective_status_entries`.
@@ -3528,7 +3546,12 @@ impl GitPanel {
                     .into_iter()
                     .map(|entry| DiscardTarget::new(entry, DiscardScope::All))
                     .collect();
-                return self.revert_entries(targets, false, window, cx);
+                return self.revert_entries(
+                    targets,
+                    !GitPanelSettings::get_global(cx).confirm_discard,
+                    window,
+                    cx,
+                );
             }
             _ => {}
         }
@@ -3590,7 +3613,12 @@ impl GitPanel {
                     .into_iter()
                     .map(|entry| DiscardTarget::new(entry, DiscardScope::All))
                     .collect();
-                return self.revert_entries(targets, false, window, cx);
+                return self.revert_entries(
+                    targets,
+                    !GitPanelSettings::get_global(cx).confirm_discard,
+                    window,
+                    cx,
+                );
             }
             _ => {}
         };
@@ -4355,7 +4383,6 @@ impl GitPanel {
 
                 match result {
                     Ok(()) => {
-                        this.set_skip_hooks_enabled(false, cx);
                         if options.amend {
                             this.set_amend_pending(false, cx);
                         } else {
@@ -7526,6 +7553,20 @@ impl GitPanel {
                     *hovered && !this.has_staged_changes() && !this.has_unstaged_conflicts();
                 cx.notify()
             }))
+            .gap_1()
+            .when(no_verify, |this| {
+                this.child(
+                    IconButton::new("skip-hooks-indicator", IconName::Warning)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Warning)
+                        .tooltip(Tooltip::text(
+                            "Skip Hooks is on (git commit --no-verify). Click to turn off.",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_skip_hooks_enabled(false, cx);
+                        })),
+                )
+            })
             .child(SplitButton::new(
                 ButtonLike::new_rounded_left(format!("split-button-left-{}", title))
                     .layer(ElevationIndex::ModalSurface)
@@ -9218,6 +9259,15 @@ impl GitPanel {
             ElementId::Name(format!("entry_{}_{}_checkbox_wrapper", display_name, ix).into());
         let checkbox_id: ElementId =
             ElementId::Name(format!("entry_{}_{}_checkbox", display_name, ix).into());
+        let discard_button_id: ElementId =
+            ElementId::Name(format!("entry_{}_{}_discard", display_name, ix).into());
+        let discard_tooltip: SharedString = if is_deleted {
+            "Restore File".into()
+        } else if is_created {
+            "Trash File".into()
+        } else {
+            "Discard Changes".into()
+        };
 
         let stage_status = GitPanel::stage_status_for_entry(entry, &repo);
         let stage_intent = self.stage_intent_for_entry_index(ix);
@@ -9345,6 +9395,38 @@ impl GitPanel {
                         stat.deleted as usize,
                     ))
                 })
+            })
+            .when(has_write_access && show_checkbox, |el| {
+                el.child(
+                    IconButton::new(discard_button_id, IconName::Undo)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text(discard_tooltip))
+                        .on_click({
+                            let scope =
+                                if self.section_for_entry_index(ix) == Some(Section::Unstaged) {
+                                    DiscardScope::Unstaged
+                                } else {
+                                    DiscardScope::All
+                                };
+                            let target = DiscardTarget::new(entry.clone(), scope);
+                            let this = cx.weak_entity();
+                            move |_, window, cx| {
+                                this.update(cx, |this, cx| {
+                                    let skip_prompt =
+                                        !GitPanelSettings::get_global(cx).confirm_discard;
+                                    this.revert_entries(
+                                        vec![target.clone()],
+                                        skip_prompt,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                                cx.stop_propagation();
+                            }
+                        }),
+                )
             })
             .when(show_checkbox, |this| {
                 this.child(
@@ -10957,7 +11039,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_skip_hooks_clears_after_successful_commit(cx: &mut TestAppContext) {
+    async fn test_skip_hooks_remains_enabled_after_successful_commit(cx: &mut TestAppContext) {
         init_test(cx);
         let (fs, _, _, panel, mut cx) = setup_git_panel_with_changes(
             cx,
@@ -10983,7 +11065,7 @@ mod tests {
         cx.run_until_parked();
 
         panel.read_with(&cx, |panel, _| {
-            assert!(!panel.skip_hooks_enabled());
+            assert!(panel.skip_hooks_enabled());
         });
         let commit_count = fs
             .with_git_state(path!("/project/.git").as_ref(), false, |state| {

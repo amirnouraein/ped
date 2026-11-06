@@ -111,6 +111,7 @@ pub fn request_prediction(
             prompt,
             max_tokens,
             stop_tokens,
+            None,
             api_key,
             &http_client,
         )

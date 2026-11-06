@@ -127,6 +127,7 @@ pub enum PredictEditsRequestTrigger {
     DiagnosticNavigation,
     Cli,
     Explicit,
+    ExplicitHighEffort,
     BufferEdit,
     LSPCompletionAccepted,
     PredictionAccepted,

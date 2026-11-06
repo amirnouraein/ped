@@ -1,12 +1,15 @@
 use crate::{commit_view::CommitView, create_tag_at_commit};
 use git::Oid;
-use gpui::{Action, ClipboardItem, Entity, FocusHandle, SharedString, WeakEntity, Window, actions};
+use gpui::{
+    Action, ClipboardItem, Entity, FocusHandle, PromptLevel, SharedString, WeakEntity, Window,
+    actions,
+};
 use project::{GIT_COMMAND_TASK_TAG, git_store::Repository};
 
 use task::{TaskContext, TaskVariables, VariableName};
 use ui::{Color, ContextMenu, ContextMenuEntry, IconName, IconPosition, prelude::*};
 use util::ResultExt as _;
-use workspace::Workspace;
+use workspace::{Workspace, notifications::DetachAndPromptErr};
 
 actions!(
     git_graph,
@@ -142,6 +145,40 @@ pub(crate) fn commit_context_menu(
                             create_tag_at_commit(sha, false, repository, workspace, window, cx);
                         })
                         .log_err();
+                }
+            })
+            .entry("Revert Commit…", None, {
+                let repository = repository.clone();
+                let sha_short = sha_short.clone();
+                move |window, cx| {
+                    let Some(repository) = repository.as_ref().and_then(WeakEntity::upgrade) else {
+                        return;
+                    };
+                    let prompt = window.prompt(
+                        PromptLevel::Warning,
+                        &format!("Revert commit {sha_short}?"),
+                        Some("This creates a new commit that undoes its changes."),
+                        &["Revert", "Cancel"],
+                        cx,
+                    );
+                    window
+                        .spawn(cx, async move |cx| {
+                            if prompt.await? != 0 {
+                                return anyhow::Ok(());
+                            }
+                            repository
+                                .update(cx, |repository, _| {
+                                    repository.revert_commit(sha.to_string())
+                                })
+                                .await??;
+                            Ok(())
+                        })
+                        .detach_and_prompt_err(
+                            "Failed to revert commit",
+                            window,
+                            cx,
+                            |error, _, _| Some(error.to_string()),
+                        );
                 }
             })
             .when(source == CommitContextMenuSource::GitPanel, |menu| {
